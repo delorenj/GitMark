@@ -1,0 +1,2 @@
+provider = "ollama"
+model = "qwen3.5:35b"

@@ -1,0 +1,526 @@
+#!/bin/bash
+# git-ai-resolver - AI-powered autonomous git conflict resolution
+# Part of gittyup - https://github.com/hellosubconscious/gittyup
+# Usage: git-ai-resolver [resolution_mode]
+#   resolution_mode: "rebase" (default) or "merge"
+
+set -euo pipefail
+
+RESOLUTION_MODE="${1:-rebase}"
+
+# Resolve SCRIPT_DIR through symlinks (portable, no GNU readlink -f)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# Config
+CONFIG_FILE="${GITTYUP_CONFIG:-$HOME/.config/gittyup/config.toml}"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+log() {
+    echo -e "${BLUE}[gittyup]${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}[gittyup] WARNING:${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[gittyup] ERROR:${NC} $1"
+}
+
+success() {
+    echo -e "${GREEN}[gittyup]${NC} $1"
+}
+
+# Check if we're in the middle of a conflict resolution
+is_in_conflict() {
+    # Check for rebase in progress
+    if [[ -d ".git/rebase-merge" ]] || [[ -d ".git/rebase-apply" ]]; then
+        return 0
+    fi
+    # Check for merge in progress
+    if [[ -f ".git/MERGE_HEAD" ]]; then
+        return 0
+    fi
+    # Check for cherry-pick/revert in progress
+    if [[ -f ".git/CHERRY_PICK_HEAD" ]] || [[ -f ".git/REVERT_HEAD" ]]; then
+        return 0
+    fi
+    # Check for unmerged files
+    if git diff --name-only --diff-filter=U | grep -q .; then
+        return 0
+    fi
+    return 1
+}
+
+# Get list of conflicted files
+get_conflicted_files() {
+    git diff --name-only --diff-filter=U 2>/dev/null || true
+}
+
+# Get conflict details for a file
+get_conflict_details() {
+    local file="$1"
+    echo "=== CONFLICT DETAILS FOR: $file ==="
+    echo ""
+    echo "--- Git Status ---"
+    git status --porcelain "$file" 2>/dev/null || true
+    echo ""
+    echo "--- Diff (ours vs theirs) ---"
+    git diff :1:"$file" :2:"$file" 2>/dev/null | head -50 || true
+    echo ""
+    echo "--- Their Changes ---"
+    git diff :1:"$file" :3:"$file" 2>/dev/null | head -50 || true
+    echo ""
+    echo "--- Conflict Markers in File ---"
+    grep -n "<<<<<<<\|=======\|>>>>>>>" "$file" 2>/dev/null | head -20 || true
+    echo ""
+    echo "--- File Content (with context) ---"
+    head -100 "$file" 2>/dev/null || true
+}
+
+# Read config value from TOML (simple key = "value" parsing)
+read_config() {
+    local key="$1"
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error "Config not found: $CONFIG_FILE"
+        error "Run 'make install' from the gittyup directory or create it manually."
+        exit 1
+    fi
+    grep -E "^${key}\s*=" "$CONFIG_FILE" | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]'
+}
+
+# Call OpenRouter-compatible API
+call_ai() {
+    local prompt="$1"
+    local provider model api_key api_url
+
+    provider=$(read_config "provider")
+    model=$(read_config "model")
+
+    case "$provider" in
+        openrouter)
+            api_key="${OPENROUTER_API_KEY:-}"
+            api_url="https://openrouter.ai/api/v1/chat/completions"
+            ;;
+        openai)
+            api_key="${OPENAI_API_KEY:-}"
+            api_url="https://api.openai.com/v1/chat/completions"
+            ;;
+        ollama)
+            api_key=""
+            api_url="${OLLAMA_HOST:-http://localhost:11434}/v1/chat/completions"
+            ;;
+        *)
+            error "Unsupported provider: $provider"
+            return 1
+            ;;
+    esac
+
+    if [[ "$provider" != "ollama" && -z "$api_key" ]]; then
+        error "No API key found for provider '$provider'"
+        return 1
+    fi
+
+    local auth_header=""
+    if [[ -n "$api_key" ]]; then
+        auth_header="Authorization: Bearer $api_key"
+    fi
+
+    local response
+    response=$(curl -s --max-time 60 "$api_url" \
+        -H "Content-Type: application/json" \
+        ${auth_header:+-H "$auth_header"} \
+        -d "$(jq -n --arg model "$model" --arg prompt "$prompt" '{
+            model: $model,
+            messages: [{ role: "user", content: $prompt }],
+            temperature: 0.2
+        }')" 2>/dev/null)
+
+    if [[ -z "$response" ]]; then
+        return 1
+    fi
+
+    echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+}
+
+# Analyze conflict and get AI resolution recommendation
+analyze_conflict_with_ai() {
+    local conflict_details="$1"
+    local file="$2"
+
+    local prompt="You are a git conflict resolution expert. Analyze this git conflict and recommend the best resolution strategy.
+
+$conflict_details
+
+Based on the conflict above, respond with EXACTLY ONE of these strategies:
+
+1. KEEP_OURS - Use our version (current branch changes)
+2. KEEP_THEIRS - Accept their version (incoming changes)
+3. RESOLVE_MARKERS - Resolve by intelligently combining both versions
+4. ABORT - Cannot resolve automatically, needs manual intervention
+
+Respond in this exact format:
+STRATEGY: <strategy_name>
+REASON: <brief explanation of why this strategy is best>
+
+Guidelines for choosing:
+- KEEP_OURS for local config, environment-specific files, work-in-progress
+- KEEP_THEIRS for upstream fixes, dependency updates, documentation
+- RESOLVE_MARKERS when both sides have valuable changes that can be merged
+- ABORT for complex refactoring, API signature changes, or when uncertain"
+
+    local model
+    model=$(read_config "model")
+    log "Consulting $model for resolution strategy..."
+
+    local ai_response
+    ai_response=$(call_ai "$prompt" || echo "STRATEGY: ABORT
+REASON: AI API error")
+
+    echo "$ai_response"
+}
+
+# Apply resolution based on strategy
+apply_resolution() {
+    local file="$1"
+    local strategy="$2"
+    local conflict_details="$3"
+
+    case "$strategy" in
+        "KEEP_OURS")
+            log "Applying KEEP_OURS for $file"
+            git checkout --ours "$file"
+            git add "$file"
+            success "Resolved $file: kept our version"
+            return 0
+            ;;
+        "KEEP_THEIRS")
+            log "Applying KEEP_THEIRS for $file"
+            git checkout --theirs "$file"
+            git add "$file"
+            success "Resolved $file: accepted their version"
+            return 0
+            ;;
+        "RESOLVE_MARKERS")
+            log "Attempting intelligent marker resolution for $file"
+            if resolve_conflict_markers "$file" "$conflict_details"; then
+                git add "$file"
+                success "Resolved $file: intelligent merge applied"
+                return 0
+            else
+                warn "Failed to resolve markers intelligently for $file"
+                return 1
+            fi
+            ;;
+        "ABORT")
+            error "AI recommends ABORT for $file - requires manual resolution"
+            return 1
+            ;;
+        *)
+            warn "Unknown strategy: $strategy, trying heuristic resolution"
+            return 1
+            ;;
+    esac
+}
+
+# Try to resolve conflict markers intelligently
+resolve_conflict_markers() {
+    local file="$1"
+    local conflict_details="$2"
+
+    local file_content
+    file_content=$(cat "$file")
+
+    local prompt="You are resolving a git conflict. Here is the file with conflict markers:
+
+File: $file
+
+$file_content
+
+Please resolve the conflict by:
+1. Choosing the best version OR combining both intelligently
+2. Removing all conflict markers (<<<<<<<, =======, >>>>>>>)
+3. Ensuring the result is syntactically valid (if code) and logically correct
+
+Respond ONLY with the resolved file content, no explanations."
+
+    log "Asking AI to resolve conflict markers in $file..."
+
+    local resolved_content
+    resolved_content=$(call_ai "$prompt")
+
+    if [[ -n "$resolved_content" ]] && ! echo "$resolved_content" | grep -q "<<<<<<<"; then
+        echo "$resolved_content" > "$file"
+        return 0
+    fi
+
+    return 1
+}
+
+# Heuristic resolution when AI is unavailable
+heuristic_resolution() {
+    local file="$1"
+
+    log "Applying heuristic resolution for $file"
+
+    # Determine file type and apply appropriate strategy
+    if echo "$file" | grep -qE "\.(lock|json\.lock|yarn\.lock|package-lock\.json|poetry\.lock|Cargo\.lock)$"; then
+        # Lock files: typically accept theirs for updates
+        git checkout --theirs "$file"
+        git add "$file"
+        success "Resolved $file (lock file): accepted their version"
+        return 0
+    fi
+
+    if echo "$file" | grep -qE "(\.env|local\.json|\.local\.|config\.local)"; then
+        # Local config files: keep ours
+        git checkout --ours "$file"
+        git add "$file"
+        success "Resolved $file (local config): kept our version"
+        return 0
+    fi
+
+    if echo "$file" | grep -qE "(README|CHANGELOG|LICENSE|\.md)$"; then
+        # Documentation: accept theirs (usually updates)
+        git checkout --theirs "$file"
+        git add "$file"
+        success "Resolved $file (documentation): accepted their version"
+        return 0
+    fi
+
+    # Default: try simple resolution
+    if git checkout --theirs "$file" 2>/dev/null; then
+        git add "$file"
+        success "Resolved $file: accepted their version (default)"
+        return 0
+    fi
+
+    return 1
+}
+
+# Resolve a single file
+resolve_file() {
+    local file="$1"
+
+    log "Resolving conflicts in: $file"
+
+    local conflict_details
+    conflict_details=$(get_conflict_details "$file")
+
+    # Try AI analysis first
+    local ai_response
+    ai_response=$(analyze_conflict_with_ai "$conflict_details" "$file" 2>/dev/null || echo "STRATEGY: ABORT")
+
+    local strategy
+    strategy=$(echo "$ai_response" | grep "^STRATEGY:" | cut -d: -f2 | tr -d ' ' || echo "ABORT")
+    local reason
+    reason=$(echo "$ai_response" | grep "^REASON:" | cut -d: -f2- || echo "No reason provided")
+
+    log "AI Strategy: $strategy"
+    log "AI Reason: $reason"
+
+    if apply_resolution "$file" "$strategy" "$conflict_details"; then
+        return 0
+    fi
+
+    # Fallback to heuristic
+    if heuristic_resolution "$file"; then
+        return 0
+    fi
+
+    error "Could not resolve $file automatically"
+    return 1
+}
+
+# Main resolution flow
+resolve_conflicts() {
+    local failed_files=()
+    local resolved_count=0
+
+    log "Starting AI-powered conflict resolution..."
+    log "Mode: $RESOLUTION_MODE"
+
+    local conflicted_files
+    conflicted_files=$(get_conflicted_files)
+
+    if [[ -z "$conflicted_files" ]]; then
+        warn "No conflicted files found"
+        return 0
+    fi
+
+    log "Found $(echo "$conflicted_files" | wc -l) conflicted file(s)"
+
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+
+        if resolve_file "$file"; then
+            ((resolved_count++))
+        else
+            failed_files+=("$file")
+        fi
+    done <<< "$conflicted_files"
+
+    # Summary
+    echo ""
+    log "=== Resolution Summary ==="
+    success "Resolved: $resolved_count file(s)"
+
+    if [[ ${#failed_files[@]} -gt 0 ]]; then
+        error "Failed to resolve: ${#failed_files[@]} file(s)"
+        for f in "${failed_files[@]}"; do
+            echo "  - $f"
+        done
+        return 1
+    fi
+
+    return 0
+}
+
+# Continue the rebase/merge after resolution
+continue_operation() {
+    log "Continuing $RESOLUTION_MODE..."
+
+    if [[ "$RESOLUTION_MODE" == "rebase" ]]; then
+        if git rebase --continue 2>/dev/null; then
+            success "Rebase continued successfully"
+            return 0
+        else
+            # Check if there are still conflicts
+            if is_in_conflict; then
+                warn "Rebase still has conflicts, continuing resolution..."
+                return 2
+            else
+                error "Rebase failed to continue"
+                return 1
+            fi
+        fi
+    elif [[ "$RESOLUTION_MODE" == "merge" ]]; then
+        if git merge --continue 2>/dev/null || git commit 2>/dev/null; then
+            success "Merge completed successfully"
+            return 0
+        else
+            if is_in_conflict; then
+                warn "Merge still has conflicts, continuing resolution..."
+                return 2
+            else
+                error "Merge failed to continue"
+                return 1
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# Abort current operation
+abort_operation() {
+    log "Aborting current $RESOLUTION_MODE..."
+
+    if [[ "$RESOLUTION_MODE" == "rebase" ]]; then
+        git rebase --abort 2>/dev/null || true
+    elif [[ "$RESOLUTION_MODE" == "merge" ]]; then
+        git merge --abort 2>/dev/null || true
+    fi
+
+    success "Operation aborted"
+}
+
+# Main function
+main() {
+    log "gittyup resolver starting..."
+
+    # Check if we're in a git repo
+    if ! git rev-parse --git-dir &>/dev/null; then
+        error "Not in a git repository"
+        exit 1
+    fi
+
+    # Check for conflicts
+    if ! is_in_conflict; then
+        log "No conflicts detected - nothing to resolve"
+        exit 0
+    fi
+
+    # Detect operation mode if not specified
+    if [[ -d ".git/rebase-merge" ]] || [[ -d ".git/rebase-apply" ]]; then
+        RESOLUTION_MODE="rebase"
+    elif [[ -f ".git/MERGE_HEAD" ]]; then
+        RESOLUTION_MODE="merge"
+    fi
+
+    log "Detected operation: $RESOLUTION_MODE"
+
+    # Show configured provider/model
+    local provider model
+    provider=$(read_config "provider")
+    model=$(read_config "model")
+    log "Provider: $provider | Model: $model"
+
+    # Resolve conflicts (with retry loop)
+    local max_iterations=5
+    local iteration=0
+
+    while is_in_conflict && [[ $iteration -lt $max_iterations ]]; do
+        ((iteration++))
+        log "Resolution attempt $iteration of $max_iterations"
+
+        if resolve_conflicts; then
+            if ! is_in_conflict; then
+                success "All conflicts resolved!"
+                break
+            fi
+
+            # Try to continue operation
+            local continue_result
+            if continue_operation; then
+                break
+            elif [[ $? -eq 2 ]]; then
+                # Still have conflicts, continue loop
+                continue
+            else
+                error "Failed to continue operation"
+                exit 1
+            fi
+        else
+            error "Conflict resolution failed"
+
+            # Show remaining conflicts
+            local remaining
+            remaining=$(get_conflicted_files)
+            if [[ -n "$remaining" ]]; then
+                error "Remaining conflicts:"
+                echo "$remaining" | while read -r f; do
+                    echo "  - $f"
+                done
+            fi
+
+            exit 1
+        fi
+    done
+
+    if is_in_conflict; then
+        error "Could not resolve all conflicts after $max_iterations attempts"
+        exit 1
+    fi
+
+    success "Conflict resolution complete!"
+    exit 0
+}
+
+# Handle abort signal
+trap 'error "Interrupted"; abort_operation; exit 130' INT TERM
+
+main "$@"
