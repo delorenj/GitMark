@@ -1,0 +1,20 @@
+# Lefthook configuration for GitMark
+# https://github.com/evilmartians/lefthook
+
+pre-commit:
+  parallel: true
+  commands:
+    secrets-check:
+      run: bin/lefthook-secrets-check {staged_files}
+      fail_text: "
+        ╔════════════════════════════════════════════════════════════════╗
+        ║                    ⚠️  SECRET DETECTED  ⚠️                      ║
+        ╠════════════════════════════════════════════════════════════════╣
+        ║  Potential secret or sensitive file detected in your commit.   ║
+        ║                                                                ║
+        ║  If this is a false positive, you can:                         ║
+        ║    1. Use --no-verify to bypass (NOT RECOMMENDED)              ║
+        ║    2. Add the file to .lefthook-ignore                         ║
+        ║    3. Remove the secret and use environment variables instead  ║
+        ╚════════════════════════════════════════════════════════════════╝
+        "

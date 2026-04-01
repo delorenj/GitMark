@@ -1,0 +1,19 @@
+# Lefthook ignore patterns
+# Add file patterns here to skip secret detection
+# These patterns are in addition to the built-in skip patterns
+
+# Documentation
+*.md
+*.mdx
+
+# Test fixtures (if they contain mock secrets)
+# test/fixtures/*
+# __tests__/fixtures/*
+
+# Example files (should not contain real secrets)
+*.example
+*.template
+.env.example
+
+# This script itself
+bin/lefthook-secrets-check

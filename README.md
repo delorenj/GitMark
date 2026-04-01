@@ -1,4 +1,4 @@
-# gittyup
+# GitMark
 
 AI-powered git checkpoint and conflict resolution.
 
@@ -10,25 +10,42 @@ AI-powered git checkpoint and conflict resolution.
 ## Install
 
 ```sh
-git clone https://github.com/hellosubconscious/gittyup.git ~/code/gittyup
-cd ~/code/gittyup
+git clone https://github.com/hellosubconscious/GitMark.git ~/code/GitMark
+cd ~/code/GitMark
 make install
 ```
 
 This will:
 - Symlink `git-checkpoint` and `git-ai-resolver` into `~/.local/bin/`
-- Create `~/.config/gittyup/config.toml` with defaults (if it doesn't exist)
+- Create `~/.config/GitMark/config.toml` with defaults (if it doesn't exist)
+- Install lefthook pre-commit hooks (if lefthook is installed)
+
+### Installing lefthook (optional, for pre-commit hooks)
+
+```sh
+# macOS
+brew install lefthook
+
+# Debian/Ubuntu
+curl -1sLf 'https://dl.cloudsmith.io/public/evilmartians/lefthook/setup.deb.sh' | sudo -E bash
+sudo apt install lefthook
+
+# npm
+npm install -g @evilmartians/lefthook
+```
+
+Then run `lefthook install` in the repo to enable pre-commit hooks.
 
 ## Uninstall
 
 ```sh
-cd ~/code/gittyup
+cd ~/code/GitMark
 make uninstall
 ```
 
 ## Config
 
-`~/.config/gittyup/config.toml`
+`~/.config/GitMark/config.toml`
 
 ```toml
 provider = "ollama"
@@ -43,7 +60,7 @@ model = "qwen3.5:35b"
 | OpenAI | `openai` | `OPENAI_API_KEY` |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
 
-Override config path with `GITTYUP_CONFIG` env var.
+Override config path with `GITMARK_CONFIG` env var.
 
 ## Usage
 
@@ -64,3 +81,33 @@ git-ai-resolver merge
 ## Dependencies
 
 - bash, git, curl, jq
+
+## Secret Detection (Pre-commit Hooks)
+
+This repository uses [lefthook](https://github.com/evilmartians/lefthook) to run pre-commit hooks that detect potential secrets:
+
+- **API keys** (generic patterns, AWS keys, GitHub tokens, Slack tokens, etc.)
+- **Private keys** (RSA, DSA, EC, PGP)
+- **Environment files** (`.env`, `.local`, etc.)
+- **Credential files** (`.aws/credentials`, `.ssh/id_*`, etc.)
+- **Passwords and tokens** in config files
+
+If a secret is detected, the commit will be blocked with instructions on how to proceed.
+
+### Bypassing the check (NOT RECOMMENDED)
+
+```sh
+git commit --no-verify
+```
+
+### Adding exceptions
+
+Edit `.lefthook-ignore` to add file patterns that should be skipped:
+
+```
+# Example: Skip test fixtures with mock secrets
+test/fixtures/*
+
+# Example: Skip specific config files
+*.config.json
+```

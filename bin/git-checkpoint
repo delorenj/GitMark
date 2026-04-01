@@ -1,6 +1,6 @@
 #!/bin/bash
 # git-checkpoint - Deterministic git checkpoint with AI conflict resolution
-# Part of gittyup - https://github.com/hellosubconscious/gittyup
+# Part of GitMark - https://github.com/hellosubconscious/GitMark
 # Usage: git-checkpoint [repository_root_path]
 
 set -euo pipefail
@@ -26,10 +26,10 @@ RED='\033[0;31m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log() { echo -e "${BLUE}[gittyup]${NC} $1"; }
-warn() { echo -e "${YELLOW}[gittyup] WARNING:${NC} $1"; }
-error() { echo -e "${RED}[gittyup] ERROR:${NC} $1"; }
-success() { echo -e "${GREEN}[gittyup]${NC} $1"; }
+log() { echo -e "${BLUE}[gitmark]${NC} $1"; }
+warn() { echo -e "${YELLOW}[gitmark] WARNING:${NC} $1"; }
+error() { echo -e "${RED}[gitmark] ERROR:${NC} $1"; }
+success() { echo -e "${GREEN}[gitmark]${NC} $1"; }
 
 if [[ -z "$REPO_ROOT" ]]; then
   echo "ERROR: Repository root path required"

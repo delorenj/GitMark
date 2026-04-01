@@ -1,6 +1,6 @@
 #!/bin/bash
 # git-ai-resolver - AI-powered autonomous git conflict resolution
-# Part of gittyup - https://github.com/hellosubconscious/gittyup
+# Part of GitMark - https://github.com/hellosubconscious/GitMark
 # Usage: git-ai-resolver [resolution_mode]
 #   resolution_mode: "rebase" (default) or "merge"
 
@@ -18,7 +18,7 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 # Config
-CONFIG_FILE="${GITTYUP_CONFIG:-$HOME/.config/gittyup/config.toml}"
+CONFIG_FILE="${GITMARK_CONFIG:-$HOME/.config/GitMark/config.toml}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -29,19 +29,19 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 log() {
-    echo -e "${BLUE}[gittyup]${NC} $1"
+    echo -e "${BLUE}[gitmark]${NC} $1"
 }
 
 warn() {
-    echo -e "${YELLOW}[gittyup] WARNING:${NC} $1"
+    echo -e "${YELLOW}[gitmark] WARNING:${NC} $1"
 }
 
 error() {
-    echo -e "${RED}[gittyup] ERROR:${NC} $1"
+    echo -e "${RED}[gitmark] ERROR:${NC} $1"
 }
 
 success() {
-    echo -e "${GREEN}[gittyup]${NC} $1"
+    echo -e "${GREEN}[gitmark]${NC} $1"
 }
 
 # Check if we're in the middle of a conflict resolution
@@ -96,7 +96,7 @@ read_config() {
     local key="$1"
     if [[ ! -f "$CONFIG_FILE" ]]; then
         error "Config not found: $CONFIG_FILE"
-        error "Run 'make install' from the gittyup directory or create it manually."
+        error "Run 'make install' from the GitMark directory or create it manually."
         exit 1
     fi
     grep -E "^${key}\s*=" "$CONFIG_FILE" | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]'
@@ -440,7 +440,7 @@ abort_operation() {
 
 # Main function
 main() {
-    log "gittyup resolver starting..."
+    log "GitMark resolver starting..."
 
     # Check if we're in a git repo
     if ! git rev-parse --git-dir &>/dev/null; then

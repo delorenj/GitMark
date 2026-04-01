@@ -1,13 +1,13 @@
 PREFIX ?= $(HOME)/.local
-CONFIG_DIR ?= $(HOME)/.config/gittyup
+CONFIG_DIR ?= $(HOME)/.config/GitMark
 BIN_DIR = $(PREFIX)/bin
 
 SCRIPTS = git-checkpoint git-ai-resolver
 
-.PHONY: install uninstall
+.PHONY: install uninstall install-lefthook
 
 install:
-	@echo "Installing gittyup..."
+	@echo "Installing GitMark..."
 	@mkdir -p $(BIN_DIR)
 	@mkdir -p $(CONFIG_DIR)
 	@for script in $(SCRIPTS); do \
@@ -22,14 +22,29 @@ install:
 		echo "  Config already exists at $(CONFIG_DIR)/config.toml (skipped)"; \
 	fi
 	@echo ""
+	@$(MAKE) install-lefthook
+	@echo ""
 	@echo "Done! Commands available: git-checkpoint, git-ai-resolver"
 	@echo "Config: $(CONFIG_DIR)/config.toml"
 
 uninstall:
-	@echo "Uninstalling gittyup..."
+	@echo "Uninstalling GitMark..."
 	@for script in $(SCRIPTS); do \
 		rm -f $(BIN_DIR)/$$script; \
 		echo "  Removed $(BIN_DIR)/$$script"; \
 	done
 	@echo "Config preserved at $(CONFIG_DIR)/config.toml"
 	@echo "Done."
+
+install-lefthook:
+	@echo "Setting up lefthook pre-commit hooks..."
+	@if command -v lefthook >/dev/null 2>&1; then \
+		lefthook install; \
+		echo "  ✓ Lefthook hooks installed"; \
+	else \
+		echo "  ⚠️  lefthook not found. Install it to enable pre-commit hooks:"; \
+		echo "     curl -1sLf 'https://dl.cloudsmith.io/public/evilmartians/lefthook/setup.deb.sh' | sudo -E bash"; \
+		echo "     sudo apt install lefthook"; \
+		echo "     # Or via npm: npm install -g @evilmartians/lefthook"; \
+		echo "     # Or via brew: brew install lefthook"; \
+	fi
