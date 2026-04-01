@@ -10,12 +10,13 @@ AI-powered git checkpoint and conflict resolution.
 ## Install
 
 ```sh
-git clone https://github.com/hellosubconscious/GitMark.git ~/code/GitMark
-cd ~/code/GitMark
+git clone https://github.com/delorenj/GitMark.git
+cd GitMark
 make install
 ```
 
 This will:
+
 - Symlink `git-checkpoint` and `git-ai-resolver` into `~/.local/bin/`
 - Create `~/.config/GitMark/config.toml` with defaults (if it doesn't exist)
 - Install lefthook pre-commit hooks (if lefthook is installed)
@@ -26,10 +27,6 @@ This will:
 # macOS
 brew install lefthook
 
-# Debian/Ubuntu
-curl -1sLf 'https://dl.cloudsmith.io/public/evilmartians/lefthook/setup.deb.sh' | sudo -E bash
-sudo apt install lefthook
-
 # npm
 npm install -g @evilmartians/lefthook
 ```
@@ -39,7 +36,6 @@ Then run `lefthook install` in the repo to enable pre-commit hooks.
 ## Uninstall
 
 ```sh
-cd ~/code/GitMark
 make uninstall
 ```
 
@@ -54,11 +50,11 @@ model = "qwen3.5:35b"
 
 ### Supported providers
 
-| Provider | Config value | API key env var |
-|----------|-------------|-----------------|
-| Ollama | `ollama` | none (uses `OLLAMA_HOST` or `localhost:11434`) |
-| OpenAI | `openai` | `OPENAI_API_KEY` |
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
+| Provider   | Config value | API key env var                                |
+| ---------- | ------------ | ---------------------------------------------- |
+| Ollama     | `ollama`     | none (uses `OLLAMA_HOST` or `localhost:11434`) |
+| OpenAI     | `openai`     | `OPENAI_API_KEY`                               |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY`                           |
 
 Override config path with `GITMARK_CONFIG` env var.
 
