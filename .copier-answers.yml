@@ -1,5 +1,5 @@
 # Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
 _commit: v0.1.0
 _src_path: https://github.com/delorenj/CommonProject
-project_description: An universal AI-driven git checkpoint utility
+project_description: A universal AI-driven git checkpoint utility
 project_name: GitMark

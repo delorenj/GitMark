@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**GitMark** - An universal AI-driven git checkpoint utility
+**GitMark** - A universal AI-driven git checkpoint utility
 
 ## Ticket Management (MANDATORY)
 
