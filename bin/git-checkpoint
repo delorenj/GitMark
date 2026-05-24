@@ -1,14 +1,32 @@
 #!/bin/bash
-# git-checkpoint - Deterministic git checkpoint with AI conflict resolution
+# git-checkpoint - git checkpoint with AI conflict resolution
 # Part of GitMark - https://github.com/hellosubconscious/GitMark
+#
 # Usage: git-checkpoint [repository_root_path]
+#   repository_root_path   Optional. Defaults to the current directory.
+#
+# Environment:
+#   GITMARK_SUBMODULE_SYNC=1  Advance CLEAN submodules to their default-branch
+#                             tip. OFF by default: clean submodules are left at
+#                             the commit pinned by the parent repo (the safe
+#                             default - avoids silently moving submodule pointers).
+#   NO_COLOR=1                Disable ANSI color in output.
+#
+# Notes:
+#   - Commits run through the repo's normal pre-commit hooks (e.g. GitMark's
+#     lefthook secrets-check). This script NEVER uses --no-verify, so a hook
+#     that blocks a commit (a detected secret, etc.) correctly aborts the
+#     checkpoint with a non-zero exit code. Secret protection therefore depends
+#     on the target repo having its hooks installed (`lefthook install`).
+#   - ALLOW_NO_TICKET is exported so that a commit-msg hook enforcing ticket
+#     references will permit these automated checkpoint commits.
 
 set -euo pipefail
 
-REPO_ROOT="${1:-$(pwd)}"
+# ALLOW_NO_TICKET: let any commit-msg ticket-enforcement hook accept auto commits.
 export ALLOW_NO_TICKET=1
 
-# Resolve SCRIPT_DIR through symlinks (portable, no GNU readlink -f)
+# --- Resolve SCRIPT_DIR through symlinks (portable, no GNU readlink -f) ---
 SOURCE="${BASH_SOURCE[0]}"
 while [ -L "$SOURCE" ]; do
   DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
@@ -16,196 +34,299 @@ while [ -L "$SOURCE" ]; do
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-
 AI_RESOLVER="$SCRIPT_DIR/git-ai-resolver"
 
-# Colors for output
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log() { echo -e "${BLUE}[gitmark]${NC} $1"; }
-warn() { echo -e "${YELLOW}[gitmark] WARNING:${NC} $1"; }
-error() { echo -e "${RED}[gitmark] ERROR:${NC} $1"; }
+# --- Colors: only when stdout is a TTY and NO_COLOR is unset ---
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
+else
+  GREEN=''; YELLOW=''; RED=''; BLUE=''; NC=''
+fi
+log()     { echo -e "${BLUE}[gitmark]${NC} $1"; }
+warn()    { echo -e "${YELLOW}[gitmark] WARNING:${NC} $1" >&2; }
+error()   { echo -e "${RED}[gitmark] ERROR:${NC} $1" >&2; }
 success() { echo -e "${GREEN}[gitmark]${NC} $1"; }
 
-if [[ -z "$REPO_ROOT" ]]; then
-  echo "ERROR: Repository root path required"
-  echo "Usage: $0 <repository_root_path>"
+usage() {
+  cat <<'EOF'
+Usage: git-checkpoint [repository_root_path]
+
+Stages all changes, commits a timestamped checkpoint, rebases onto the default
+branch (when not already on it), and pushes. Handles submodules. Conflicts are
+resolved with the GitMark AI resolver when available.
+
+Arguments:
+  repository_root_path   Optional. Defaults to the current directory.
+
+Environment:
+  GITMARK_SUBMODULE_SYNC=1   Advance clean submodules to their branch tip.
+  NO_COLOR=1                 Disable colored output.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# --- Overall exit status. record_failure() flips it without aborting the run ---
+EXIT_CODE=0
+record_failure() { EXIT_CODE=1; error "$1"; }
+
+# --- Is the repo currently mid-conflict (rebase/merge/cherry-pick/unmerged)? ---
+repo_in_conflict() {
+  local gd
+  gd="$(git rev-parse --git-dir 2>/dev/null)" || return 1
+  if [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]]; then return 0; fi
+  if [[ -f "$gd/MERGE_HEAD" || -f "$gd/CHERRY_PICK_HEAD" || -f "$gd/REVERT_HEAD" ]]; then return 0; fi
+  if git diff --name-only --diff-filter=U 2>/dev/null | grep -q .; then return 0; fi
+  return 1
+}
+
+# --- Determine the default branch authoritatively, then fall back ---
+# Prefer origin/HEAD (set at clone). Fall back to main, THEN master, so a repo
+# that has both origin/main and origin/master does not wrongly pick master.
+detect_default_branch() {
+  local ref
+  if ref="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)" && [[ -n "$ref" ]]; then
+    echo "${ref#refs/remotes/origin/}"; return 0
+  fi
+  if git show-ref --verify --quiet refs/remotes/origin/main; then echo "main"; return 0; fi
+  if git show-ref --verify --quiet refs/remotes/origin/master; then echo "master"; return 0; fi
+  echo "main"
+}
+
+# --- Cleanup on interrupt: abort only a rebase that WE started ---
+WE_STARTED_REBASE=0
+cleanup() {
+  if [[ "$WE_STARTED_REBASE" == "1" ]] && repo_in_conflict; then
+    warn "Interrupted during rebase; aborting to restore a clean state."
+    git rebase --abort 2>/dev/null || true
+  fi
+}
+trap cleanup INT TERM
+
+# --- Push with integrate-and-retry + AI conflict resolution (used everywhere) ---
+push_with_recovery() {
+  local branch="$1"
+  if git push origin "$branch"; then
+    success "Push successful"; return 0
+  fi
+  warn "Push rejected; fetching and rebasing before retry..."
+  WE_STARTED_REBASE=1
+  if git pull --rebase origin "$branch"; then
+    WE_STARTED_REBASE=0
+    if git push origin "$branch"; then success "Push successful after rebase"; return 0; fi
+    error "Push still rejected after a clean rebase"; return 1
+  fi
+  # pull --rebase failed: distinguish a real conflict from network/auth/etc.
+  if repo_in_conflict; then
+    warn "Pull-rebase hit conflicts"
+    if [[ -x "$AI_RESOLVER" ]]; then
+      log "Invoking AI conflict resolver..."
+      if "$AI_RESOLVER"; then
+        WE_STARTED_REBASE=0
+        if git push origin "$branch"; then success "Push successful after AI resolution"; return 0; fi
+        error "Push failed even after conflict resolution"; return 1
+      fi
+      error "AI resolver could not resolve conflicts; aborting rebase"
+    else
+      error "No AI resolver available; aborting rebase"
+    fi
+    git rebase --abort 2>/dev/null || true
+    WE_STARTED_REBASE=0
+    return 1
+  fi
+  WE_STARTED_REBASE=0
+  error "Pull-rebase failed (not a conflict - check network, auth, or upstream branch)"
+  return 1
+}
+
+# ================================ main ================================
+REPO_ROOT="${1:-$(pwd)}"
+
+# Validate REPO_ROOT and require it to be the work-tree TOP LEVEL.
+# rev-parse (not `[[ -d .git ]]`) supports submodules and linked worktrees,
+# whose .git is a FILE, not a directory - fixing the old guard that rejected
+# this script's own submodule recursion. Requiring the top level (rather than
+# merely "inside a work tree") refuses a subdirectory path, so we never
+# checkpoint an unrelated ENCLOSING repo by surprise.
+if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  error "Not a git repository: $REPO_ROOT"
+  exit 1
+fi
+_top="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$_top" ]] || [[ "$(cd "$_top" 2>/dev/null && pwd -P)" != "$(cd "$REPO_ROOT" 2>/dev/null && pwd -P)" ]]; then
+  error "Not a repository root: $REPO_ROOT"
+  error "Pass the top level of a repo or submodule; subdirectories are refused to avoid checkpointing an enclosing repo."
   exit 1
 fi
 
-if [[ ! -d "$REPO_ROOT/.git" ]]; then
-  echo "ERROR: Not a git repository: $REPO_ROOT"
-  exit 1
+cd "$REPO_ROOT" || { error "Cannot cd into: $REPO_ROOT"; exit 1; }
+REPO_NAME="$(basename "$(pwd)")"
+
+# --- Single-instance lock per repo, so concurrent runs can't corrupt state ---
+GIT_DIR="$(git rev-parse --git-dir)"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$GIT_DIR/gitmark-checkpoint.lock"
+  if ! flock -n 9; then
+    log "Another git-checkpoint is already running for $REPO_NAME; skipping."
+    exit 0
+  fi
+else
+  warn "flock not found; running without a concurrency lock."
 fi
 
-cd "$REPO_ROOT"
-REPO_NAME=$(basename "$(pwd)")
+echo "=== Checkpointing: $REPO_NAME ==="
 
-# Check for any existing conflicts before starting
-if [[ -d ".git/rebase-merge" ]] || [[ -d ".git/rebase-apply" ]] || [[ -f ".git/MERGE_HEAD" ]]; then
+# --- Resolve any pre-existing conflict before touching anything ---
+if repo_in_conflict; then
   warn "Repository is in the middle of a conflicting operation"
   if [[ -x "$AI_RESOLVER" ]]; then
     log "Attempting to resolve existing conflicts with AI..."
     if "$AI_RESOLVER"; then
       success "Existing conflicts resolved"
     else
-      error "Could not resolve existing conflicts, please fix manually first"
+      error "Could not resolve existing conflicts; fix manually first"
       exit 1
     fi
   else
-    error "Repository has unresolved conflicts. Please fix manually first."
+    error "Repository has unresolved conflicts; fix manually first"
     exit 1
   fi
 fi
 
-echo "=== Checkpointing: $REPO_NAME ==="
+# --- Fetch once (all remotes, prune stale tracking refs) ---
+echo "Fetching remotes..."
+git fetch --all --prune || warn "fetch failed (continuing with cached refs)"
 
-# Fetch all remotes
-echo "Fetching all remotes..."
-git fetch --all --prune || true
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
+echo "Current branch: $CURRENT_BRANCH"
+DEFAULT_BRANCH="$(detect_default_branch)"
 
-# Check for submodules
+# --- Detect submodules ---
 HAS_SUBMODULES=false
-if [[ -f ".gitmodules" ]] && [[ -s ".gitmodules" ]]; then
-  SUBMODULE_COUNT=$(git submodule status 2>/dev/null | wc -l || echo "0")
-  if [[ "$SUBMODULE_COUNT" -gt 0 ]]; then
-    HAS_SUBMODULES=true
-    echo "Found $SUBMODULE_COUNT submodule(s)"
-  fi
+if [[ -f ".gitmodules" && -s ".gitmodules" ]] && [[ -n "$(git submodule status 2>/dev/null)" ]]; then
+  HAS_SUBMODULES=true
 fi
 
-# Handle submodules first (if any)
 if [[ "$HAS_SUBMODULES" == true ]]; then
   echo "Processing submodules..."
-  git submodule update --init --recursive || true
+  git submodule update --init --recursive || warn "submodule update failed (continuing)"
 
-  # For each submodule: add, commit, push
+  CHECKPOINT_BIN="$(command -v git-checkpoint 2>/dev/null || true)"
+  [[ -z "$CHECKPOINT_BIN" ]] && CHECKPOINT_BIN="$SCRIPT_DIR/git-checkpoint"
+  export CHECKPOINT_BIN
+
+  # `git submodule foreach` runs each command via /bin/sh (dash on Debian/Ubuntu),
+  # which has NO `[[ ]]`. Everything in the block below MUST stay POSIX sh: use
+  # `[ ]` and `=`, not `[[ ]]`/`==`.
+  #   dirty submodule -> recurse (commit + push its own contents)
+  #   clean submodule -> left at its pinned commit, UNLESS GITMARK_SUBMODULE_SYNC=1
+  # shellcheck disable=SC2016
   git submodule foreach '
-        echo "--- Processing submodule: $name ---"
-        git add -A 2>/dev/null || true
-
-        # Only commit if there are staged changes
-        if ! git diff --cached --quiet 2>/dev/null; then
-            git commit -m "checkpoint: $(date -u +%Y-%m-%dT%H:%M:%SZ) auto-commit" || true
-
-            # Push current branch
-            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-            if [[ "$CURRENT_BRANCH" != "HEAD" ]]; then
-                git push origin "$CURRENT_BRANCH" || echo "  Warning: Push failed for $name"
-            fi
-        else
-            echo "  No changes to commit in $name"
-        fi
-    '
+    echo "--- Submodule: $name ---"
+    if [ -n "$(git status --porcelain)" ]; then
+      echo "  Dirty; running git-checkpoint..."
+      "$CHECKPOINT_BIN" "$(pwd)" || echo "  WARNING: checkpoint failed for $name"
+    elif [ "${GITMARK_SUBMODULE_SYNC:-0}" = "1" ]; then
+      SUB_DEFAULT=main
+      if git show-ref --verify --quiet refs/remotes/origin/main; then
+        SUB_DEFAULT=main
+      elif git show-ref --verify --quiet refs/remotes/origin/master; then
+        SUB_DEFAULT=master
+      fi
+      SUB_CUR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+      if [ "$SUB_CUR" != "$SUB_DEFAULT" ]; then
+        git checkout "$SUB_DEFAULT" 2>/dev/null || { echo "  Could not switch to $SUB_DEFAULT; leaving as-is"; exit 0; }
+      fi
+      echo "  Advancing to origin/$SUB_DEFAULT..."
+      git pull --ff-only origin "$SUB_DEFAULT" || echo "  WARNING: ff pull failed for $name"
+    else
+      echo "  Clean; left at pinned commit (set GITMARK_SUBMODULE_SYNC=1 to advance)."
+    fi
+  ' || warn "submodule processing reported errors"
 fi
 
-# Get current branch
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-echo "Current branch: $CURRENT_BRANCH"
-
-# Stage all changes (including untracked)
+# --- Stage and commit ---
 echo "Staging all changes..."
-git add -A
+git add -A || { record_failure "git add -A failed"; exit "$EXIT_CODE"; }
 
-# Check if there are changes to commit
-if git diff --cached --quiet && [[ -z "$(git status --porcelain)" ]]; then
+if git diff --cached --quiet; then
   echo "No changes to commit"
 else
-  # Commit with timestamp
   COMMIT_MSG="checkpoint: $(date -u +%Y-%m-%dT%H:%M:%SZ) auto-commit"
   echo "Committing: $COMMIT_MSG"
-  git commit -m "$COMMIT_MSG" || true
-fi
-
-# Rebase onto main if not on main
-if [[ "$CURRENT_BRANCH" != "main" ]] && [[ "$CURRENT_BRANCH" != "master" ]]; then
-  echo "Not on main (on $CURRENT_BRANCH), rebasing onto main..."
-  git fetch origin main || git fetch origin master || true
-
-  # Determine default branch
-  DEFAULT_BRANCH="main"
-  if git show-ref --verify --quiet refs/remotes/origin/master; then
-    DEFAULT_BRANCH="master"
-  fi
-
-  # Rebase
-  if git rebase "origin/$DEFAULT_BRANCH"; then
-    success "Rebase successful"
+  # No --no-verify: pre-commit hooks (e.g. secrets-check) must be able to block this.
+  if git commit -m "$COMMIT_MSG"; then
+    success "Committed"
   else
-    warn "Rebase encountered conflicts"
-
-    # Try AI-powered resolution if available
-    if [[ -x "$AI_RESOLVER" ]]; then
-      log "Invoking AI conflict resolver..."
-      if "$AI_RESOLVER" rebase; then
-        success "AI resolver successfully handled conflicts"
-      else
-        error "AI resolver failed to resolve conflicts"
-        warn "Aborting rebase and continuing without it..."
-        git rebase --abort 2>/dev/null || true
-      fi
-    else
-      warn "AI resolver not available, aborting rebase..."
-      git rebase --abort || true
-    fi
+    record_failure "Commit failed (a pre-commit hook may have blocked it - e.g. a detected secret - or git identity is unset). Nothing was checkpointed."
+    exit "$EXIT_CODE"
   fi
 fi
 
-# Push with potential conflict handling
-log "Pushing..."
-if [[ "$CURRENT_BRANCH" != "HEAD" ]]; then
-  if git push origin "$CURRENT_BRANCH"; then
-    success "Push successful"
-  else
-    warn "Push failed, attempting pull and retry with AI resolution if needed..."
-
-    # Try to pull with rebase
-    if git pull --rebase origin "$CURRENT_BRANCH" 2>/dev/null; then
-      success "Pull with rebase successful"
-      if git push origin "$CURRENT_BRANCH"; then
-        success "Push successful after rebase"
-      else
-        error "Push still failed after rebase"
-      fi
-    else
-      warn "Pull rebase encountered conflicts"
-
-      # Try AI resolver for pull conflicts
-      if [[ -x "$AI_RESOLVER" ]]; then
-        log "Invoking AI conflict resolver for pull conflicts..."
-        if "$AI_RESOLVER" rebase; then
-          success "AI resolver handled pull conflicts"
-          if git push origin "$CURRENT_BRANCH"; then
-            success "Push successful after AI resolution"
-          else
-            error "Push failed even after conflict resolution"
-          fi
-        else
-          error "AI resolver failed, aborting..."
-          git rebase --abort 2>/dev/null || true
-        fi
-      else
-        warn "No AI resolver available, aborting rebase..."
-        git rebase --abort 2>/dev/null || true
-      fi
-    fi
-  fi
+# --- Rebase onto the default branch (skip when on it, or detached) ---
+REBASE_OK=1
+if [[ "$CURRENT_BRANCH" == "HEAD" ]]; then
+  warn "Detached HEAD: skipping rebase and push."
+elif [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
+  : # already on the default branch - no rebase needed
 else
-  log "Detached HEAD state, skipping push"
-fi
-
-# If submodules were processed, update their pointers in parent repo
-if [[ "$HAS_SUBMODULES" == true ]]; then
-  echo "Updating submodule pointers..."
-  git add -A
-  if ! git diff --cached --quiet 2>/dev/null; then
-    git commit -m "checkpoint: update submodule pointers $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
-    git push origin "$CURRENT_BRANCH" || echo "Warning: Push failed for submodule update"
+  echo "Rebasing $CURRENT_BRANCH onto origin/$DEFAULT_BRANCH..."
+  if ! git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
+    record_failure "origin/$DEFAULT_BRANCH not found; cannot rebase"
+    REBASE_OK=0
+  else
+    WE_STARTED_REBASE=1
+    if git rebase "origin/$DEFAULT_BRANCH"; then
+      WE_STARTED_REBASE=0
+      success "Rebase successful"
+    elif [[ -x "$AI_RESOLVER" ]]; then
+      warn "Rebase conflicts; invoking AI resolver..."
+      if "$AI_RESOLVER"; then
+        WE_STARTED_REBASE=0
+        success "AI resolver handled rebase conflicts"
+      else
+        WE_STARTED_REBASE=0
+        record_failure "AI resolver failed to resolve rebase conflicts; aborting rebase"
+        git rebase --abort 2>/dev/null || true
+        REBASE_OK=0
+      fi
+    else
+      WE_STARTED_REBASE=0
+      record_failure "Rebase conflicts and no AI resolver available; aborting rebase"
+      git rebase --abort 2>/dev/null || true
+      REBASE_OK=0
+    fi
   fi
 fi
 
-echo "=== Checkpoint complete: $REPO_NAME ==="
+# --- Push ---
+if [[ "$CURRENT_BRANCH" == "HEAD" ]]; then
+  : # detached: already warned, nothing to push
+elif [[ "$REBASE_OK" != "1" ]]; then
+  warn "Skipping push because the rebase did not complete cleanly."
+else
+  log "Pushing $CURRENT_BRANCH..."
+  push_with_recovery "$CURRENT_BRANCH" || record_failure "Push failed for $CURRENT_BRANCH"
+fi
+
+# --- Update submodule pointers in the parent (same resilient push path) ---
+if [[ "$HAS_SUBMODULES" == true && "$CURRENT_BRANCH" != "HEAD" && "$REBASE_OK" == "1" ]]; then
+  git add -A || warn "git add for submodule pointers failed"
+  if ! git diff --cached --quiet; then
+    echo "Updating submodule pointers..."
+    if git commit -m "checkpoint: update submodule pointers $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+      push_with_recovery "$CURRENT_BRANCH" || record_failure "Push failed for submodule-pointer update"
+    else
+      record_failure "Commit failed for submodule-pointer update"
+    fi
+  fi
+fi
+
+if [[ "$EXIT_CODE" -eq 0 ]]; then
+  success "=== Checkpoint complete: $REPO_NAME ==="
+else
+  error "=== Checkpoint finished WITH ERRORS: $REPO_NAME ==="
+fi
+exit "$EXIT_CODE"
