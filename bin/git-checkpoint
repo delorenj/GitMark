@@ -1,6 +1,6 @@
 #!/bin/bash
 # git-checkpoint - git checkpoint with AI conflict resolution
-# Part of GitMark - https://github.com/hellosubconscious/GitMark
+# Part of GitMark - https://github.com/delorenj/GitMark
 #
 # Usage: git-checkpoint [repository_root_path]
 #   repository_root_path   Optional. Defaults to the current directory.

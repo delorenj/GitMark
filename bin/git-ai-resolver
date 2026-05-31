@@ -1,6 +1,6 @@
 #!/bin/bash
 # git-ai-resolver - AI-powered autonomous git conflict resolution
-# Part of GitMark - https://github.com/hellosubconscious/GitMark
+# Part of GitMark - https://github.com/delorenj/GitMark
 # Usage: git-ai-resolver [resolution_mode]
 #   resolution_mode: "rebase" (default) or "merge"
 
