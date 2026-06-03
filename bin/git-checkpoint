@@ -13,11 +13,21 @@
 #   NO_COLOR=1                Disable ANSI color in output.
 #
 # Notes:
-#   - Commits run through the repo's normal pre-commit hooks (e.g. GitMark's
+#   - Secret protection is BUILT IN (see secret_guard): before every commit the
+#     staged set is scrubbed of known-secret paths (.env, shell_snapshots/,
+#     private keys) and aborted if staged additions contain high-signal secret
+#     material. This runs regardless of whether the target repo has hooks
+#     installed, so a wiped/overwritten .gitignore can no longer leak secrets.
+#     Override a false positive with GITMARK_ALLOW_SECRETS=1.
+#   - Commits ALSO run through the repo's normal pre-commit hooks (e.g. GitMark's
 #     lefthook secrets-check). This script NEVER uses --no-verify, so a hook
-#     that blocks a commit (a detected secret, etc.) correctly aborts the
-#     checkpoint with a non-zero exit code. Secret protection therefore depends
-#     on the target repo having its hooks installed (`lefthook install`).
+#     that blocks a commit correctly aborts the checkpoint with a non-zero exit.
+#   - Pushes likewise run the repo's pre-push hooks. A push can be rejected for
+#     reasons a rebase CANNOT fix - a failing pre-push gate (lint/format/test), a
+#     server-side rule (protected branch / pre-receive hook), or an unreachable
+#     remote. The push recovery only fetches+rebases when the branch is actually
+#     BEHIND origin; otherwise it diagnoses the real cause and stops, instead of
+#     looping a pointless rebase and reporting a misleading sync error.
 #   - ALLOW_NO_TICKET is exported so that a commit-msg hook enforcing ticket
 #     references will permit these automated checkpoint commits.
 
@@ -105,40 +115,189 @@ cleanup() {
 }
 trap cleanup INT TERM
 
+# --- Push once, streaming AND capturing combined output into PUSH_OUT ---
+# Uses `tee` so the user still sees live hook/push output, while we keep a copy
+# to classify the failure. PIPESTATUS[0] (not the pipeline status) gives git's
+# own exit code regardless of pipefail/tee.
+PUSH_OUT=""
+attempt_push() {
+  local branch="$1" tmp st=0
+  tmp="$(mktemp 2>/dev/null || echo "/tmp/gitmark-push.$$")"
+  if git push origin "$branch" 2>&1 | tee "$tmp"; then st=0; else st="${PIPESTATUS[0]}"; fi
+  PUSH_OUT="$(cat "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
+  return "$st"
+}
+
+# --- Classify WHY a push failed, from its captured output ---
+# Echoes one of: nonff | remote | auth | hook | other
+# Order matters: a non-fast-forward and a server rejection BOTH also print
+# "failed to push some refs", so they must be matched before the generic hook
+# case. This only refines the diagnostic message - the decision to rebase is
+# gated on is_behind_remote(), never on this string match.
+classify_push_failure() {
+  local out="$1"
+  if printf '%s' "$out" | grep -Eq '\[remote rejected\]|pre-receive hook declined|protected branch|\bGH00[0-9]|push declined|cannot lock ref'; then
+    echo remote; return 0
+  fi
+  if printf '%s' "$out" | grep -Eq '\[rejected\]|\(non-fast-forward\)|\(fetch first\)|tip of your current branch is behind|Updates were rejected because'; then
+    echo nonff; return 0
+  fi
+  if printf '%s' "$out" | grep -Eiq 'could not read from remote repository|permission denied|authentication failed|fatal: (could not|unable to) (access|read)|could not resolve host|connection (refused|timed out)|operation timed out|the remote end hung up|repository not found|does not appear to be a git repository|terminal prompts disabled'; then
+    echo auth; return 0
+  fi
+  if printf '%s' "$out" | grep -Eq 'failed to push some refs'; then
+    echo hook; return 0
+  fi
+  echo other; return 0
+}
+
+# --- Is the local branch genuinely BEHIND its remote tip? ---
+# This - not the rejection message - is the authoritative test for "a rebase
+# would help". Fetches just this branch (cheap) and compares via FETCH_HEAD,
+# which is reliable regardless of remote-tracking refspec config. A failed
+# fetch (unreachable remote) reports "not behind", so we never rebase blindly.
+is_behind_remote() {
+  local branch="$1" behind
+  git fetch origin "$branch" >/dev/null 2>&1 || return 1
+  behind="$(git rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)"
+  [[ "$behind" =~ ^[0-9]+$ ]] && [[ "$behind" -gt 0 ]]
+}
+
 # --- Push with integrate-and-retry + AI conflict resolution (used everywhere) ---
+# A push can fail for reasons a rebase CANNOT fix: a local pre-push hook
+# (lint/format/test gate), a server-side rule (protected branch / pre-receive
+# hook), or an unreachable remote (auth/network). Blindly rebasing on any push
+# failure - the old behavior - wastes a fetch+rebase, then reports a misleading
+# "Push still rejected after a clean rebase" that hides the true cause. So we
+# only rebase when the branch is provably behind the remote, and otherwise
+# diagnose the real reason and stop.
 push_with_recovery() {
   local branch="$1"
-  if git push origin "$branch"; then
+  if attempt_push "$branch"; then
     success "Push successful"; return 0
   fi
-  warn "Push rejected; fetching and rebasing before retry..."
-  WE_STARTED_REBASE=1
-  if git pull --rebase origin "$branch"; then
-    WE_STARTED_REBASE=0
-    if git push origin "$branch"; then success "Push successful after rebase"; return 0; fi
-    error "Push still rejected after a clean rebase"; return 1
-  fi
-  # pull --rebase failed: distinguish a real conflict from network/auth/etc.
-  if repo_in_conflict; then
-    warn "Pull-rebase hit conflicts"
-    if [[ -x "$AI_RESOLVER" ]]; then
-      log "Invoking AI conflict resolver..."
-      if "$AI_RESOLVER"; then
-        WE_STARTED_REBASE=0
-        if git push origin "$branch"; then success "Push successful after AI resolution"; return 0; fi
-        error "Push failed even after conflict resolution"; return 1
-      fi
-      error "AI resolver could not resolve conflicts; aborting rebase"
-    else
-      error "No AI resolver available; aborting rebase"
+  local kind; kind="$(classify_push_failure "$PUSH_OUT")"
+
+  if is_behind_remote "$branch"; then
+    warn "Push rejected; the remote has new commits. Fetching and rebasing before retry..."
+    WE_STARTED_REBASE=1
+    if git pull --rebase origin "$branch"; then
+      WE_STARTED_REBASE=0
+      if attempt_push "$branch"; then success "Push successful after rebase"; return 0; fi
+      # Integrated cleanly but STILL can't push -> a local hook or remote rule,
+      # not a sync problem. More rebasing won't help.
+      case "$(classify_push_failure "$PUSH_OUT")" in
+        hook)   error "Integrated remote changes, but a pre-push hook is still blocking the push (lint/format/test). Fix the issues reported above and re-run." ;;
+        remote) error "Integrated remote changes, but the remote rejected the push (protected branch / pre-receive hook). Review the remote's rules above." ;;
+        *)      error "Push still rejected after integrating remote changes; see the output above for the cause." ;;
+      esac
+      return 1
     fi
-    git rebase --abort 2>/dev/null || true
+    # pull --rebase failed: distinguish a real conflict from network/auth/etc.
+    if repo_in_conflict; then
+      warn "Pull-rebase hit conflicts"
+      if [[ -x "$AI_RESOLVER" ]]; then
+        log "Invoking AI conflict resolver..."
+        if "$AI_RESOLVER"; then
+          WE_STARTED_REBASE=0
+          if attempt_push "$branch"; then success "Push successful after AI resolution"; return 0; fi
+          error "Push failed even after conflict resolution"; return 1
+        fi
+        error "AI resolver could not resolve conflicts; aborting rebase"
+      else
+        error "No AI resolver available; aborting rebase"
+      fi
+      git rebase --abort 2>/dev/null || true
+      WE_STARTED_REBASE=0
+      return 1
+    fi
     WE_STARTED_REBASE=0
+    error "Pull-rebase failed (not a conflict - check network, auth, or upstream branch)"
     return 1
   fi
-  WE_STARTED_REBASE=0
-  error "Pull-rebase failed (not a conflict - check network, auth, or upstream branch)"
+
+  # Not behind origin/$branch: a fetch+rebase cannot help. Diagnose precisely so
+  # the user knows what to actually fix instead of chasing a phantom sync issue.
+  case "$kind" in
+    hook)
+      error "Push blocked by a local pre-push hook (lint/format/test gate) - not a sync problem."
+      error "Rebasing won't help; fix the issues reported above, then re-run the checkpoint."
+      error "gitmark never bypasses hooks - to override deliberately, push manually with --no-verify."
+      ;;
+    remote)
+      error "Push rejected by the remote (protected branch or pre-receive hook)."
+      error "A rebase can't fix this; review the remote's rules in the output above."
+      ;;
+    auth)
+      error "Push failed: the remote is unreachable (auth, network, or unknown host)."
+      error "Check your credentials and connectivity; a rebase won't help here."
+      ;;
+    *)
+      error "Push failed, and the branch is not behind origin/$branch, so a rebase would not help."
+      error "See the push output above for the underlying cause."
+      ;;
+  esac
   return 1
+}
+
+# --- Built-in secret guard (defense-in-depth, runs regardless of repo hooks) ---
+# The repo-hook secrets-check (lefthook) only protects repos that installed it.
+# This guard runs unconditionally on the STAGED set, protecting every repo this
+# script touches even if its .gitignore was wiped/overwritten or hooks are absent.
+# Two layers:
+#   1) PATH denylist  -> silently UNSTAGE files that must never be committed
+#                        (.env, shell_snapshots/, private keys, ...). Safe
+#                        templates (.env.example/.sample/.template/.dist/.op)
+#                        are kept.
+#   2) CONTENT scan   -> ABORT the checkpoint if staged additions contain
+#                        high-signal secret material. Never auto-strips content;
+#                        a hit means a human must look.
+# Override (rare, for a genuine false positive): GITMARK_ALLOW_SECRETS=1
+secret_guard() {
+  [[ "${GITMARK_ALLOW_SECRETS:-0}" == "1" ]] && { warn "Secret-guard DISABLED via GITMARK_ALLOW_SECRETS=1"; return 0; }
+
+  # --- Layer 1: unstage known-secret paths ---
+  local f base
+  local -a stripped=()
+  while IFS= read -r -d '' f; do
+    base="${f##*/}"
+    case "$base" in
+      *.example|*.sample|*.template|*.dist|*.op) continue ;;  # safe templates / 1Password refs
+    esac
+    case "$base" in
+      .env|.env.*) stripped+=("$f") ;;
+      *.shell_snapshot) stripped+=("$f") ;;
+      *.pem|*.p12|*.pfx|*.key) stripped+=("$f") ;;
+      id_rsa|id_dsa|id_ecdsa|id_ed25519|*_rsa|*_dsa|*_ecdsa|*_ed25519) stripped+=("$f") ;;
+      *)
+        case "$f" in
+          shell_snapshots/*|*/shell_snapshots/*) stripped+=("$f") ;;
+        esac ;;
+    esac
+  done < <(git diff --cached --name-only -z --diff-filter=ACM 2>/dev/null)
+
+  if [[ ${#stripped[@]} -gt 0 ]]; then
+    warn "Secret-guard: unstaging files that must never be committed:"
+    for f in "${stripped[@]}"; do echo "      - $f" >&2; done
+    git restore --staged -- "${stripped[@]}" 2>/dev/null \
+      || git reset -q HEAD -- "${stripped[@]}" 2>/dev/null || true
+  fi
+
+  # --- Layer 2: scan staged ADDED lines for secret material; ABORT on hit ---
+  local added pat
+  added="$(git diff --cached --no-color -U0 --diff-filter=ACM 2>/dev/null | grep '^+' | grep -v '^+++' || true)"
+  # High-signal patterns: GitHub tokens, AWS keys, Slack, 1Password service tokens,
+  # Vault service tokens, common LLM API keys, PEM private keys.
+  pat='ghp_[A-Za-z0-9]{36}|gh[osru]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{60,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|ops_[A-Za-z0-9_-]{40,}|hvs\.[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{24,}|sk-or-v1-[A-Za-z0-9]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+  if [[ -n "$added" ]] && printf '%s\n' "$added" | grep -aEq "$pat"; then
+    error "Secret-guard: staged content contains likely LIVE secrets. Checkpoint ABORTED."
+    error "Matched (redacted):"
+    printf '%s\n' "$added" | grep -aEo "$pat" | sed -E 's/(.{8}).*/\1…[REDACTED]/' | sort -u | sed 's/^/        /' >&2
+    error "Remove the secret from the working tree (and from history if already committed),"
+    error "or set GITMARK_ALLOW_SECRETS=1 to override for this run."
+    exit 1
+  fi
 }
 
 # ================================ main ================================
@@ -250,6 +409,10 @@ fi
 # --- Stage and commit ---
 echo "Staging all changes..."
 git add -A || { record_failure "git add -A failed"; exit "$EXIT_CODE"; }
+
+# Built-in secret protection: unstage secret paths, abort on secret content.
+# Runs even when the target repo has no pre-commit hooks installed.
+secret_guard
 
 if git diff --cached --quiet; then
   echo "No changes to commit"
