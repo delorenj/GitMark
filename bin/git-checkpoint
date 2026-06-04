@@ -112,6 +112,7 @@ cleanup() {
     warn "Interrupted during rebase; aborting to restore a clean state."
     git rebase --abort 2>/dev/null || true
   fi
+  [[ -n "${PUSH_TMP:-}" ]] && rm -f "$PUSH_TMP" 2>/dev/null || true
 }
 trap cleanup INT TERM
 
@@ -120,34 +121,43 @@ trap cleanup INT TERM
 # to classify the failure. PIPESTATUS[0] (not the pipeline status) gives git's
 # own exit code regardless of pipefail/tee.
 PUSH_OUT=""
+PUSH_TMP=""   # tracked so the INT/TERM trap can remove it if a push is interrupted
 attempt_push() {
   local branch="$1" tmp st=0
   tmp="$(mktemp 2>/dev/null || echo "/tmp/gitmark-push.$$")"
+  PUSH_TMP="$tmp"
   if git push origin "$branch" 2>&1 | tee "$tmp"; then st=0; else st="${PIPESTATUS[0]}"; fi
   PUSH_OUT="$(cat "$tmp" 2>/dev/null || true)"
-  rm -f "$tmp"
+  rm -f "$tmp"; PUSH_TMP=""
   return "$st"
 }
 
 # --- Classify WHY a push failed, from its captured output ---
 # Echoes one of: nonff | remote | auth | hook | other
-# Order matters: a non-fast-forward and a server rejection BOTH also print
-# "failed to push some refs", so they must be matched before the generic hook
-# case. This only refines the diagnostic message - the decision to rebase is
-# gated on is_behind_remote(), never on this string match.
+# This ONLY refines the diagnostic message - the decision to rebase is gated on
+# is_behind_remote(), never on this string match - so a misclassification can at
+# worst print a slightly-off reason, never rebase wrongly. Two ordering rules:
+#   * remote/non-fast-forward rejections also print "failed to push some refs",
+#     so they're matched BEFORE the generic hook case.
+#   * a genuine auth/network failure fails EARLY with `fatal: ...` and never
+#     prints "failed to push some refs"; a blocked pre-push hook DOES print it.
+#     So "failed to push some refs" => hook is checked BEFORE the auth scan, so
+#     a lint tool that happens to emit "permission denied"/"timeout" in its own
+#     output can't masquerade as an auth error. Matches are case-insensitive so
+#     e.g. GitHub's capitalized "Protected branch" still classifies as remote.
 classify_push_failure() {
   local out="$1"
-  if printf '%s' "$out" | grep -Eq '\[remote rejected\]|pre-receive hook declined|protected branch|\bGH00[0-9]|push declined|cannot lock ref'; then
+  if printf '%s' "$out" | grep -Eiq '\[remote rejected\]|pre-receive hook declined|protected branch|\bGH00[0-9]|push declined|cannot lock ref'; then
     echo remote; return 0
   fi
-  if printf '%s' "$out" | grep -Eq '\[rejected\]|\(non-fast-forward\)|\(fetch first\)|tip of your current branch is behind|Updates were rejected because'; then
+  if printf '%s' "$out" | grep -Eiq '\[rejected\]|\(non-fast-forward\)|\(fetch first\)|tip of your current branch is behind|Updates were rejected because'; then
     echo nonff; return 0
-  fi
-  if printf '%s' "$out" | grep -Eiq 'could not read from remote repository|permission denied|authentication failed|fatal: (could not|unable to) (access|read)|could not resolve host|connection (refused|timed out)|operation timed out|the remote end hung up|repository not found|does not appear to be a git repository|terminal prompts disabled'; then
-    echo auth; return 0
   fi
   if printf '%s' "$out" | grep -Eq 'failed to push some refs'; then
     echo hook; return 0
+  fi
+  if printf '%s' "$out" | grep -Eiq 'could not read from remote repository|permission denied|authentication failed|fatal: (could not|unable to) (access|read)|could not resolve host|connection (refused|timed out)|operation timed out|the remote end hung up|repository not found|does not appear to be a git repository|terminal prompts disabled'; then
+    echo auth; return 0
   fi
   echo other; return 0
 }
