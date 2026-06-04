@@ -1,2 +1,17 @@
 provider = "ollama"
 model = "qwen3.5:35b"
+
+# Other supported providers (uncomment ONE provider/model pair and set the
+# matching API key env var). All use the OpenAI-compatible chat schema.
+#
+# OpenAI                 -> OPENAI_API_KEY
+# provider = "openai"
+# model = "gpt-4o-mini"
+#
+# OpenRouter             -> OPENROUTER_API_KEY  (also covers DeepSeek, etc.)
+# provider = "openrouter"
+# model = "deepseek/deepseek-v4-flash"
+#
+# Kimi for Coding        -> KIMI_API_KEY
+# provider = "kimi"
+# model = "kimi-for-coding"

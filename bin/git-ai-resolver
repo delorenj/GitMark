@@ -115,6 +115,12 @@ call_ai() {
             api_key="${OPENROUTER_API_KEY:-}"
             api_url="https://openrouter.ai/api/v1/chat/completions"
             ;;
+        kimi)
+            # Kimi for Coding (Moonshot AI) - OpenAI-compatible endpoint.
+            # Use model = "kimi-for-coding" (stable id; backend maps to latest).
+            api_key="${KIMI_API_KEY:-}"
+            api_url="https://api.kimi.com/coding/v1/chat/completions"
+            ;;
         openai)
             api_key="${OPENAI_API_KEY:-}"
             api_url="https://api.openai.com/v1/chat/completions"

@@ -50,13 +50,32 @@ model = "qwen3.5:35b"
 
 ### Supported providers
 
-| Provider   | Config value | API key env var                                |
-| ---------- | ------------ | ---------------------------------------------- |
-| Ollama     | `ollama`     | none (uses `OLLAMA_HOST` or `localhost:11434`) |
-| OpenAI     | `openai`     | `OPENAI_API_KEY`                               |
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY`                           |
+| Provider          | Config value | API key env var                                | Endpoint                              |
+| ----------------- | ------------ | ---------------------------------------------- | ------------------------------------- |
+| Ollama            | `ollama`     | none (uses `OLLAMA_HOST` or `localhost:11434`) | `localhost:11434/v1`                  |
+| OpenAI            | `openai`     | `OPENAI_API_KEY`                               | `api.openai.com/v1`                   |
+| OpenRouter        | `openrouter` | `OPENROUTER_API_KEY`                           | `openrouter.ai/api/v1`                |
+| Kimi for Coding   | `kimi`       | `KIMI_API_KEY`                                 | `api.kimi.com/coding/v1`              |
 
-Override config path with `GITMARK_CONFIG` env var.
+All providers use the OpenAI-compatible chat-completions schema. Override the
+config path with the `GITMARK_CONFIG` env var.
+
+#### Examples
+
+Kimi for Coding (Moonshot AI). The `kimi-for-coding` model id is stable — the
+backend transparently maps it to the latest coding model:
+
+```toml
+provider = "kimi"
+model = "kimi-for-coding"
+```
+
+DeepSeek via OpenRouter (no separate provider needed — OpenRouter exposes it):
+
+```toml
+provider = "openrouter"
+model = "deepseek/deepseek-v4-flash"
+```
 
 ## Usage
 
