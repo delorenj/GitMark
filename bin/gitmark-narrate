@@ -1,0 +1,375 @@
+#!/bin/bash
+# gitmark-narrate - derive an informative commit message for a checkpoint
+# Part of GitMark - https://github.com/delorenj/GitMark
+#
+# Emits a commit message on stdout that describes the work being checkpointed,
+# blending TWO sources:
+#   1. Bloodbank events (via candystore) - the user prompts + tool calls that
+#      PRODUCED the change (the "why" / intent). Best-effort: skipped silently
+#      when the service is unreachable.
+#   2. The staged git diff/stat + untracked files (the exact "what").
+# A fast LLM (reusing GitMark's config.toml provider/model and the same
+# OpenAI-compatible curl path as git-ai-resolver) turns that into a
+# Conventional-Commits message.
+#
+# It ALWAYS prints something useful: if bloodbank AND the LLM are both
+# unavailable it degrades to a deterministic diff-stat summary, so the caller
+# (git-checkpoint) can commit unconditionally and never hang on this step.
+#
+# Usage: gitmark-narrate --repo <path> [--since <iso8601>] [--to <iso8601>]
+#
+# Environment:
+#   GITMARK_CANDYSTORE_URL         candystore query API (default http://127.0.0.1:8683)
+#   GITMARK_NARRATE_PROVIDER       override config provider ("none" skips the LLM)
+#   GITMARK_NARRATE_MODEL          override config model
+#   GITMARK_NARRATE_API_KEY        override the API key (literal or op:// ref)
+#   GITMARK_NARRATE_API_URL        override the chat-completions endpoint (proxy/test)
+#
+# The API key is resolved from (in order): GITMARK_NARRATE_API_KEY, the config
+# `api_key` field, then the provider env var (KIMI_API_KEY / OPENROUTER_API_KEY /
+# OPENAI_API_KEY). Any of these may be a 1Password `op://vault/item/field`
+# reference, dereferenced at runtime via the `op` CLI.
+#   GITMARK_NARRATE_MAXDIFF        max diff lines fed to the LLM (default 400)
+#   GITMARK_NARRATE_MAXEVENTS      max bloodbank events pulled (default 250)
+#   GITMARK_NARRATE_LLM_TIMEOUT    seconds to wait on the LLM (default 30)
+#   GITMARK_NARRATE_PRINT_CONTEXT  =1 -> print the (redacted) assembled context and exit (for tests)
+#   GITMARK_NARRATE_DEBUG          =1 -> log provider/model/url + raw LLM response to stderr
+#   GITMARK_CONFIG                 path to config.toml (default ~/.config/GitMark/config.toml)
+#
+# Exit status is always 0 when a repo is given and has content to describe; the
+# caller should treat empty stdout as "fall back to a timestamp message".
+
+set -uo pipefail
+
+CONFIG_FILE="${GITMARK_CONFIG:-$HOME/.config/GitMark/config.toml}"
+CANDYSTORE_URL="${GITMARK_CANDYSTORE_URL:-http://127.0.0.1:8683}"
+MAXDIFF="${GITMARK_NARRATE_MAXDIFF:-400}"
+MAXEVENTS="${GITMARK_NARRATE_MAXEVENTS:-250}"
+LLM_TIMEOUT="${GITMARK_NARRATE_LLM_TIMEOUT:-30}"
+
+REPO=""
+SINCE=""
+TO=""
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)  REPO="${2:-}"; shift 2 ;;
+    --since) SINCE="${2:-}"; shift 2 ;;
+    --to)    TO="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+[[ -z "$REPO" ]] && REPO="$(pwd)"
+if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "gitmark-narrate: not a git repository: $REPO" >&2
+  exit 1
+fi
+
+# --- Read a value from the simple `key = "value"` TOML (same parser as resolver) ---
+# NOTE: this strips ALL whitespace, so it is only safe for single-token values
+# like provider/model. For values that may contain spaces (e.g. a 1Password
+# `op://vault/item/API Keys/field` reference) use read_config_value below.
+read_config() {
+  local key="$1"
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  grep -E "^${key}\s*=" "$CONFIG_FILE" 2>/dev/null \
+    | sed 's/#.*//' | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]' | head -n1
+}
+
+# --- Space-preserving TOML value reader (quote-aware) -------------------------
+# Returns the double-quoted value verbatim (internal spaces kept), or the bare
+# token with a trailing #comment and surrounding whitespace trimmed.
+read_config_value() {
+  local key="$1"
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  awk -v k="$key" '
+    $0 ~ "^[[:space:]]*"k"[[:space:]]*=" {
+      sub(/^[^=]*=/, "")
+      if (match($0, /"[^"]*"/)) { print substr($0, RSTART+1, RLENGTH-2); exit }
+      sub(/#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+    }' "$CONFIG_FILE"
+}
+
+# --- Dereference a secret that may be a 1Password `op://` reference -----------
+# A literal value passes through unchanged. An `op://...` reference is resolved
+# via the `op` CLI (needs OP_SERVICE_ACCOUNT_TOKEN or a signed-in session; the
+# session-end hook has it, a bare cron job typically does not). Failure -> empty,
+# so the caller degrades gracefully to the deterministic message.
+resolve_secret() {
+  local v="$1"
+  [[ -z "$v" ]] && return 0
+  case "$v" in
+    op://*)
+      command -v op >/dev/null 2>&1 || return 0
+      op read "$v" 2>/dev/null || true
+      ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+
+# --- Redact high-signal secret material before anything is sent to an LLM. ---
+# tool arguments from bloodbank are NOT scrubbed upstream and can carry live
+# tokens/keys/paths, so scrub the entire assembled context (and the final
+# message) through here. Mirrors git-checkpoint's secret_guard patterns, plus a
+# generic KEY=VALUE / Bearer catch-all. GNU sed `I` flag = case-insensitive.
+redact() {
+  sed -E \
+    -e 's/(ghp_[A-Za-z0-9]{36})/[REDACTED]/g' \
+    -e 's/(gh[osru]_[A-Za-z0-9]{36})/[REDACTED]/g' \
+    -e 's/(github_pat_[A-Za-z0-9_]{60,})/[REDACTED]/g' \
+    -e 's/(AKIA[0-9A-Z]{16})/[REDACTED]/g' \
+    -e 's/(xox[baprs]-[A-Za-z0-9-]{10,})/[REDACTED]/g' \
+    -e 's/(ops_[A-Za-z0-9_-]{40,})/[REDACTED]/g' \
+    -e 's/(hvs\.[A-Za-z0-9_-]{20,})/[REDACTED]/g' \
+    -e 's/(sk-ant-[A-Za-z0-9_-]{24,})/[REDACTED]/g' \
+    -e 's/(sk-or-v1-[A-Za-z0-9]{20,})/[REDACTED]/g' \
+    -e 's/(sk-proj-[A-Za-z0-9_-]{20,})/[REDACTED]/g' \
+    -e 's/(-----BEGIN [A-Z ]*PRIVATE KEY-----)/[REDACTED]/g' \
+    -e 's/([Bb]earer[[:space:]]+)[A-Za-z0-9._-]{12,}/\1[REDACTED]/g' \
+    -e 's/((api[_-]?key|token|secret|password|passwd|pwd)[[:space:]]*[:=][[:space:]]*)[^[:space:]"'"'"']{6,}/\1[REDACTED]/gI'
+}
+
+# --- Time window: default `since` = last commit, `to` = now (both UTC ...Z) ---
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+to_utc() { # normalize an arbitrary ISO string to UTC ...Z; empty on failure
+  local s="$1"
+  [[ -z "$s" ]] && return 0
+  date -u -d "$s" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true
+}
+
+[[ -z "$TO" ]] && TO="$(now_utc)"
+if [[ -z "$SINCE" ]]; then
+  SINCE="$(git -C "$REPO" log -1 --format=%cI 2>/dev/null || true)"
+fi
+SINCE_UTC="$(to_utc "$SINCE")"; [[ -z "$SINCE_UTC" ]] && SINCE_UTC="1970-01-01T00:00:00Z"
+TO_UTC="$(to_utc "$TO")";       [[ -z "$TO_UTC" ]] && TO_UTC="$(now_utc)"
+
+# --- Choose diff scope: staged if anything is staged, else the working tree ---
+CACHED="--cached"
+if git -C "$REPO" diff --cached --quiet 2>/dev/null; then
+  CACHED=""   # nothing staged; describe the working tree instead
+fi
+
+git_stat()  { git -C "$REPO" diff $CACHED --stat 2>/dev/null; }
+git_short() { git -C "$REPO" diff $CACHED --shortstat 2>/dev/null; }
+git_names() { git -C "$REPO" diff $CACHED --name-status 2>/dev/null; }
+git_body()  { git -C "$REPO" diff $CACHED --no-color 2>/dev/null | head -n "$MAXDIFF"; }
+untracked() { [[ -z "$CACHED" ]] && git -C "$REPO" ls-files --others --exclude-standard 2>/dev/null | head -n 40; }
+
+# --- Bloodbank context: prompts + tool calls for THIS repo in the window ---
+# Best-effort. Returns nothing (exit 0) if curl/jq missing or service is down.
+gather_bloodbank() {
+  command -v curl >/dev/null 2>&1 || return 0
+  command -v jq   >/dev/null 2>&1 || return 0
+  curl -sf --max-time 2 "$CANDYSTORE_URL/healthz" >/dev/null 2>&1 || return 0
+
+  local project resp
+  project="$(basename "$REPO")"
+  resp="$(curl -sf --max-time 5 --get "$CANDYSTORE_URL/events" \
+    --data-urlencode "project=$project" \
+    --data-urlencode "from=$SINCE_UTC" \
+    --data-urlencode "to=$TO_UTC" \
+    --data-urlencode "limit=$MAXEVENTS" 2>/dev/null)" || return 0
+  [[ -z "$resp" ]] && return 0
+
+  # Filter to events whose working_directory is inside THIS repo (project name
+  # can collide across repos), sort chronologically, and emit two compact
+  # sections: user prompts (intent) and tool calls (actions).
+  printf '%s' "$resp" | jq -r --arg repo "$REPO" '
+    ( .events // [] )
+    | map(select((.data.working_directory // "") | startswith($repo)))
+    | sort_by(.time)
+    as $e
+    | ( [ $e[]
+          | select(.type == "bloodbank.v1.conversation.turn.started")
+          | (.data.prompt_text // "") | gsub("[\r\n]+"; " ") | .[0:400]
+          | select(length > 0) ]
+        | unique ) as $prompts
+    | ( [ $e[]
+          | select(.type == "bloodbank.v1.agent.tool.requested")
+          | (.data.tool_name // "?") + ": " +
+            ( ( .data.arguments.command
+                // .data.arguments.file_path
+                // .data.arguments.path
+                // .data.arguments.pattern
+                // .data.arguments.description
+                // .data.arguments.query
+                // "" ) | tostring | gsub("[\r\n]+"; " ") | .[0:140] ) ]
+      ) as $tools
+    | ( if ($prompts | length) > 0
+        then "### USER PROMPTS (chronological)\n" + ( $prompts | map("- " + .) | join("\n") ) + "\n\n"
+        else "" end )
+      + ( if ($tools | length) > 0
+        then "### TOOL CALLS (chronological, " + ( $tools | length | tostring ) + " total)\n"
+             + ( $tools | .[0:60] | map("- " + .) | join("\n") )
+        else "" end )
+  ' 2>/dev/null || return 0
+}
+
+# --- Assemble the (redacted) LLM context ---
+build_context() {
+  local bb git_stat_out git_body_out unt
+  bb="$(gather_bloodbank)"
+  git_stat_out="$(git_stat)"
+  git_body_out="$(git_body)"
+  unt="$(untracked)"
+
+  {
+    if [[ -n "$bb" ]]; then
+      echo "## Intent & actions (from agent session events)"
+      echo "$bb"
+      echo
+    fi
+    echo "## Files changed (git diff --stat)"
+    echo "${git_stat_out:-（none）}"
+    if [[ -n "$unt" ]]; then
+      echo
+      echo "## Untracked files"
+      echo "$unt"
+    fi
+    echo
+    echo "## Diff (truncated to ${MAXDIFF} lines)"
+    echo '```diff'
+    echo "$git_body_out"
+    echo '```'
+  } | redact
+}
+
+# --- Call the configured OpenAI-compatible chat API (mirrors git-ai-resolver) ---
+call_ai() {
+  local prompt="$1" provider model api_key api_url auth_header="" response env_key key_ref
+  provider="${GITMARK_NARRATE_PROVIDER:-$(read_config provider)}"
+  model="${GITMARK_NARRATE_MODEL:-$(read_config model)}"
+  [[ "$provider" == "none" || -z "$provider" ]] && return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v jq   >/dev/null 2>&1 || return 1
+
+  case "$provider" in
+    openrouter) api_url="https://openrouter.ai/api/v1/chat/completions"; env_key="${OPENROUTER_API_KEY:-}" ;;
+    kimi)       api_url="https://api.kimi.com/coding/v1/chat/completions"; env_key="${KIMI_API_KEY:-}" ;;
+    openai)     api_url="https://api.openai.com/v1/chat/completions"; env_key="${OPENAI_API_KEY:-}" ;;
+    ollama)     api_url="${OLLAMA_HOST:-http://localhost:11434}/v1/chat/completions"; env_key="" ;;
+    *) return 1 ;;
+  esac
+  api_url="${GITMARK_NARRATE_API_URL:-$api_url}"   # override for proxies / testing
+
+  # Key precedence: explicit narrate override -> config `api_key` (may be an
+  # op:// ref) -> provider env var. Config wins over the (possibly stale/shared)
+  # provider env var so a GitMark-specific 1Password key is used when present.
+  key_ref="${GITMARK_NARRATE_API_KEY:-}"
+  [[ -z "$key_ref" ]] && key_ref="$(read_config_value api_key)"
+  api_key="$(resolve_secret "$key_ref")"
+  [[ -z "$api_key" ]] && api_key="$(resolve_secret "$env_key")"
+  if [[ "$provider" != "ollama" && -z "$api_key" ]]; then
+    [[ "${GITMARK_NARRATE_DEBUG:-0}" == "1" ]] && echo "narrate: no usable api key for provider=$provider" >&2
+    return 1
+  fi
+  [[ -n "$api_key" ]] && auth_header="Authorization: Bearer $api_key"
+  # kimi-for-coding rejects any temperature other than 1 ("only 1 is allowed for
+  # this model"); other providers are happy with a low, more deterministic temp.
+  local temp="0.2"; [[ "$provider" == "kimi" ]] && temp="1"
+  [[ "${GITMARK_NARRATE_DEBUG:-0}" == "1" ]] && echo "narrate: provider=$provider model=$model temp=$temp url=$api_url" >&2
+
+  response="$(timeout "$LLM_TIMEOUT" curl -s --max-time "$LLM_TIMEOUT" "$api_url" \
+    -H "Content-Type: application/json" \
+    ${auth_header:+-H "$auth_header"} \
+    -d "$(jq -n --arg model "$model" --arg prompt "$prompt" --argjson temp "$temp" '{
+      model: $model,
+      messages: [{ role: "user", content: $prompt }],
+      temperature: $temp,
+      stream: false
+    }')" 2>/dev/null)" || return 1
+  if [[ "${GITMARK_NARRATE_DEBUG:-0}" == "1" ]]; then
+    echo "narrate: raw response (first 400 chars): $(printf '%s' "$response" | head -c 400)" >&2
+  fi
+  [[ -z "$response" ]] && return 1
+  printf '%s' "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+}
+
+# --- Deterministic fallback message from the git stat alone (no network/AI) ---
+deterministic_message() {
+  local names short subject stat
+  names="$(git -C "$REPO" diff $CACHED --name-only 2>/dev/null)"
+  short="$(git_short | sed -E 's/^[[:space:]]+//')"
+  stat="$(git_stat | head -n 20)"
+
+  local -a paths=()
+  local n=0 f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    n=$((n + 1))
+    [[ $n -le 3 ]] && paths+=("$(basename "$f")")
+  done <<< "$names"
+
+  if [[ $n -eq 0 ]]; then
+    subject="checkpoint: $(now_utc) auto-commit"
+  else
+    local joined; joined="$(IFS=', '; echo "${paths[*]}")"
+    [[ $n -gt 3 ]] && joined="$joined, +$((n - 3)) more"
+    subject="checkpoint: update $joined"
+    [[ -n "$short" ]] && subject="$subject ($short)"
+  fi
+
+  printf '%s\n\n' "$subject"
+  [[ -n "$stat" ]] && printf '%s\n\n' "$stat"
+  printf 'Checkpoint: %s (gitmark, no-narrative)\n' "$TO_UTC"
+}
+
+# --- Turn LLM output into a clean commit message (strip fences, add trailer) ---
+finalize_llm_message() {
+  local msg="$1"
+  # Reasoning models (e.g. the default ollama qwen) emit a <think>...</think>
+  # block before the answer; drop it so it never lands in the commit message.
+  msg="$(printf '%s' "$msg" | awk '
+    /<think>/ { skip=1 } skip==0 { print } /<\/think>/ { skip=0 }')"
+  # Drop a leading/trailing ``` fence the model may have wrapped around it.
+  msg="$(printf '%s' "$msg" | sed -E '/^```[a-zA-Z]*$/d; /^```$/d')"
+  # Trim leading/trailing blank lines.
+  msg="$(printf '%s' "$msg" | sed -E ':a;/^\n*$/{$d;N;ba}')"
+  msg="$(printf '%s' "$msg" | redact)"
+  [[ -z "${msg//[[:space:]]/}" ]] && return 1
+  printf '%s\n\n%s\n' "$msg" "Checkpoint: $TO_UTC (gitmark)"
+}
+
+# ================================ main ================================
+STAT_CHECK="$(git_stat)"
+if [[ -z "$STAT_CHECK" ]]; then
+  # Nothing to describe; emit the classic timestamp so the caller still commits.
+  echo "checkpoint: $(now_utc) auto-commit"
+  exit 0
+fi
+
+CONTEXT="$(build_context)"
+
+if [[ "${GITMARK_NARRATE_PRINT_CONTEXT:-0}" == "1" ]]; then
+  printf '%s\n' "$CONTEXT"
+  exit 0
+fi
+
+PROMPT="You are writing a git commit message for an automated checkpoint of a
+work-in-progress coding session. Below is the intent (recent user prompts and
+the tool calls the agent ran) and the actual staged diff. The code may be
+incomplete or broken - that is fine; describe what is ACTUALLY happening.
+
+Write a Conventional Commits message:
+- First line: type(scope): summary  (imperative, <= 72 chars). Use feat/fix/
+  refactor/docs/test/chore, or 'wip' when the change is clearly mid-flight.
+- Then a blank line, then 1-5 short bullet points ('- ...') describing what
+  changed and the apparent direction/goal of the work.
+- Prefer the intent/prompts for the 'why'; use the diff for the precise 'what'.
+- Output ONLY the commit message. No preamble, no code fences, no quoting.
+
+$CONTEXT"
+
+LLM_OUT="$(call_ai "$PROMPT" || true)"
+if [[ -n "${LLM_OUT//[[:space:]]/}" ]] && finalize_llm_message "$LLM_OUT"; then
+  exit 0
+fi
+
+# LLM unavailable / failed -> deterministic, still-informative message.
+deterministic_message
+exit 0

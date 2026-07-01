@@ -202,7 +202,10 @@ get_conflict_details() {
     head -100 "$file" 2>/dev/null || true
 }
 
-# Read config value from TOML (simple key = "value" parsing)
+# Read config value from TOML (simple key = "value" parsing).
+# Strips inline `# comments` (so `provider = "kimi" # [...]` yields `kimi`) and
+# ALL whitespace - safe only for single-token values like provider/model. For
+# values that may contain spaces (e.g. an op:// ref) use read_config_value.
 read_config() {
     local key="$1"
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -210,7 +213,34 @@ read_config() {
         error "Run 'make install' from the GitMark directory or create it manually."
         exit 1
     fi
-    grep -E "^${key}\s*=" "$CONFIG_FILE" | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]'
+    grep -E "^${key}\s*=" "$CONFIG_FILE" | sed 's/#.*//' | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]' | head -n1
+}
+
+# Space-preserving TOML value reader (quote-aware). Returns the double-quoted
+# value verbatim, or the bare token with trailing #comment + whitespace trimmed.
+read_config_value() {
+    local key="$1"
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    awk -v k="$key" '
+        $0 ~ "^[[:space:]]*"k"[[:space:]]*=" {
+            sub(/^[^=]*=/, "")
+            if (match($0, /"[^"]*"/)) { print substr($0, RSTART+1, RLENGTH-2); exit }
+            sub(/#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+        }' "$CONFIG_FILE"
+}
+
+# Dereference a secret that may be a 1Password op:// reference (via `op read`,
+# needs OP_SERVICE_ACCOUNT_TOKEN or a signed-in session). Literals pass through.
+resolve_secret() {
+    local v="$1"
+    [[ -z "$v" ]] && return 0
+    case "$v" in
+        op://*)
+            command -v op >/dev/null 2>&1 || return 0
+            op read "$v" 2>/dev/null || true
+            ;;
+        *) printf '%s' "$v" ;;
+    esac
 }
 
 # Call OpenRouter-compatible API
@@ -221,24 +251,21 @@ call_ai() {
     provider=$(read_config "provider")
     model=$(read_config "model")
 
+    local env_key key_ref temp
     case "$provider" in
         openrouter)
-            api_key="${OPENROUTER_API_KEY:-}"
-            api_url="https://openrouter.ai/api/v1/chat/completions"
+            api_url="https://openrouter.ai/api/v1/chat/completions"; env_key="${OPENROUTER_API_KEY:-}"
             ;;
         kimi)
             # Kimi for Coding (Moonshot AI) - OpenAI-compatible endpoint.
             # Use model = "kimi-for-coding" (stable id; backend maps to latest).
-            api_key="${KIMI_API_KEY:-}"
-            api_url="https://api.kimi.com/coding/v1/chat/completions"
+            api_url="https://api.kimi.com/coding/v1/chat/completions"; env_key="${KIMI_API_KEY:-}"
             ;;
         openai)
-            api_key="${OPENAI_API_KEY:-}"
-            api_url="https://api.openai.com/v1/chat/completions"
+            api_url="https://api.openai.com/v1/chat/completions"; env_key="${OPENAI_API_KEY:-}"
             ;;
         ollama)
-            api_key=""
-            api_url="${OLLAMA_HOST:-http://localhost:11434}/v1/chat/completions"
+            api_url="${OLLAMA_HOST:-http://localhost:11434}/v1/chat/completions"; env_key=""
             ;;
         *)
             error "Unsupported provider: $provider"
@@ -246,8 +273,14 @@ call_ai() {
             ;;
     esac
 
+    # Key precedence: config `api_key` (may be a 1Password op:// ref) over the
+    # provider env var, so a GitMark-specific key is used when present.
+    key_ref="$(read_config_value api_key)"
+    api_key="$(resolve_secret "$key_ref")"
+    [[ -z "$api_key" ]] && api_key="$(resolve_secret "$env_key")"
+
     if [[ "$provider" != "ollama" && -z "$api_key" ]]; then
-        error "No API key found for provider '$provider'"
+        error "No API key for provider '$provider' (checked config api_key + ${provider^^}_API_KEY)"
         return 1
     fi
 
@@ -256,14 +289,17 @@ call_ai() {
         auth_header="Authorization: Bearer $api_key"
     fi
 
+    # kimi-for-coding rejects any temperature except 1.
+    temp="0.2"; [[ "$provider" == "kimi" ]] && temp="1"
+
     local response
     response=$(curl -s --max-time 60 "$api_url" \
         -H "Content-Type: application/json" \
         ${auth_header:+-H "$auth_header"} \
-        -d "$(jq -n --arg model "$model" --arg prompt "$prompt" '{
+        -d "$(jq -n --arg model "$model" --arg prompt "$prompt" --argjson temp "$temp" '{
             model: $model,
             messages: [{ role: "user", content: $prompt }],
-            temperature: 0.2
+            temperature: $temp
         }')" 2>/dev/null)
 
     if [[ -z "$response" ]]; then

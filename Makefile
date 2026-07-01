@@ -2,7 +2,7 @@ PREFIX ?= $(HOME)/.local
 CONFIG_DIR ?= $(HOME)/.config/GitMark
 BIN_DIR = $(PREFIX)/bin
 
-SCRIPTS = git-checkpoint git-ai-resolver
+SCRIPTS = git-checkpoint git-ai-resolver gitmark-narrate
 
 .PHONY: install uninstall install-lefthook
 
@@ -24,7 +24,7 @@ install:
 	@echo ""
 	@$(MAKE) install-lefthook
 	@echo ""
-	@echo "Done! Commands available: git-checkpoint, git-ai-resolver"
+	@echo "Done! Commands available: git-checkpoint, git-ai-resolver, gitmark-narrate"
 	@echo "Config: $(CONFIG_DIR)/config.toml"
 
 uninstall:

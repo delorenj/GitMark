@@ -11,6 +11,14 @@
 #                             the commit pinned by the parent repo (the safe
 #                             default - avoids silently moving submodule pointers).
 #   NO_COLOR=1                Disable ANSI color in output.
+#   GITMARK_FAST=1            Skip AI narration; use a fast timestamp message.
+#                             (Also: pass --fast / --no-narrate as a flag.)
+#   GITMARK_NARRATE=0         Disable AI narration entirely.
+#   GITMARK_NARRATE_TIMEOUT   Seconds to allow for narration (default 45). On
+#                             timeout/failure the commit still happens with a
+#                             deterministic message - narration never blocks it.
+#   GITMARK_CANDYSTORE_URL    candystore query API used for the "why" of the
+#                             commit (default http://127.0.0.1:8683).
 #
 # Notes:
 #   - Secret protection is BUILT IN (see secret_guard): before every commit the
@@ -30,6 +38,12 @@
 #     looping a pointless rebase and reporting a misleading sync error.
 #   - ALLOW_NO_TICKET is exported so that a commit-msg hook enforcing ticket
 #     references will permit these automated checkpoint commits.
+#   - Commit messages are NARRATED by bin/gitmark-narrate: it blends the agent
+#     session's prompts + tool calls (bloodbank events via candystore) with the
+#     staged diff and asks a fast LLM for a Conventional-Commits message. This is
+#     strictly best-effort and time-bounded: if candystore or the LLM is down/slow
+#     it falls back to a deterministic diff-summary (and finally a timestamp), so
+#     the checkpoint is never blocked. Disable with GITMARK_FAST=1 / --fast.
 
 set -euo pipefail
 
@@ -45,6 +59,7 @@ while [ -L "$SOURCE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 AI_RESOLVER="$SCRIPT_DIR/git-ai-resolver"
+NARRATE_BIN="$SCRIPT_DIR/gitmark-narrate"
 
 # --- Colors: only when stdout is a TTY and NO_COLOR is unset ---
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -61,15 +76,27 @@ usage() {
   cat <<'EOF'
 Usage: git-checkpoint [repository_root_path]
 
-Stages all changes, commits a timestamped checkpoint, rebases onto the default
-branch (when not already on it), and pushes. Handles submodules. Conflicts are
-resolved with the GitMark AI resolver when available.
+Stages all changes, commits a checkpoint with an AI-narrated message, rebases
+onto the default branch (when not already on it), and pushes. Handles
+submodules. Conflicts are resolved with the GitMark AI resolver when available.
+
+The commit message is derived by bin/gitmark-narrate from the agent session's
+prompts + tool calls (bloodbank/candystore) and the staged diff. It is
+best-effort and time-bounded; if unavailable the checkpoint falls back to a
+deterministic message and never blocks.
 
 Arguments:
   repository_root_path   Optional. Defaults to the current directory.
 
+Options:
+  --fast, --no-narrate   Skip AI narration (fast timestamp/diff message).
+
 Environment:
   GITMARK_SUBMODULE_SYNC=1   Advance clean submodules to their branch tip.
+  GITMARK_FAST=1             Skip AI narration.
+  GITMARK_NARRATE=0          Disable AI narration entirely.
+  GITMARK_NARRATE_TIMEOUT    Seconds allowed for narration (default 45).
+  GITMARK_CANDYSTORE_URL     candystore query API (default http://127.0.0.1:8683).
   NO_COLOR=1                 Disable colored output.
 EOF
 }
@@ -77,6 +104,18 @@ EOF
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
 esac
+
+# --- Options (consume leading flags; leave the positional repo path intact) ---
+NARRATE="${GITMARK_NARRATE:-1}"
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --fast|--no-narrate) NARRATE=0; shift ;;
+    --narrate)           NARRATE=1; shift ;;
+    --)                  shift; break ;;
+    *)                   break ;;
+  esac
+done
+[[ "${GITMARK_FAST:-0}" == "1" ]] && NARRATE=0
 
 # --- Overall exit status. record_failure() flips it without aborting the run ---
 EXIT_CODE=0
@@ -107,12 +146,14 @@ detect_default_branch() {
 
 # --- Cleanup on interrupt: abort only a rebase that WE started ---
 WE_STARTED_REBASE=0
+MSG_TMP=""   # commit-message temp file; removed by the trap if we're interrupted
 cleanup() {
   if [[ "$WE_STARTED_REBASE" == "1" ]] && repo_in_conflict; then
     warn "Interrupted during rebase; aborting to restore a clean state."
     git rebase --abort 2>/dev/null || true
   fi
   [[ -n "${PUSH_TMP:-}" ]] && rm -f "$PUSH_TMP" 2>/dev/null || true
+  [[ -n "${MSG_TMP:-}" ]] && rm -f "$MSG_TMP" 2>/dev/null || true
 }
 trap cleanup INT TERM
 
@@ -427,12 +468,29 @@ secret_guard
 if git diff --cached --quiet; then
   echo "No changes to commit"
 else
-  COMMIT_MSG="checkpoint: $(date -u +%Y-%m-%dT%H:%M:%SZ) auto-commit"
-  echo "Committing: $COMMIT_MSG"
+  # Narrate the commit message from bloodbank events + the staged diff. This is
+  # best-effort and TIME-BOUNDED: on timeout/failure/empty output we fall back to
+  # a plain timestamp, so narration can never block or fail the checkpoint. The
+  # message is written to a temp file and committed via `git commit -F` so a
+  # multi-line narrative (subject + body) is preserved verbatim.
+  SINCE_ISO="$(git log -1 --format=%cI 2>/dev/null || true)"
+  MSG_TMP="$(mktemp 2>/dev/null || echo "$GIT_DIR/gitmark-msg.$$")"
+  if [[ "$NARRATE" == "1" && -x "$NARRATE_BIN" ]]; then
+    log "Deriving commit narrative (prompts + tool calls + diff)..."
+    timeout "${GITMARK_NARRATE_TIMEOUT:-45}" \
+      "$NARRATE_BIN" --repo "$(pwd)" ${SINCE_ISO:+--since "$SINCE_ISO"} \
+      > "$MSG_TMP" 2>/dev/null || true
+  fi
+  if [[ ! -s "$MSG_TMP" ]]; then
+    printf 'checkpoint: %s auto-commit\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MSG_TMP"
+  fi
+  echo "Committing: $(head -n1 "$MSG_TMP")"
   # No --no-verify: pre-commit hooks (e.g. secrets-check) must be able to block this.
-  if git commit -m "$COMMIT_MSG"; then
+  if git commit -F "$MSG_TMP"; then
     success "Committed"
+    rm -f "$MSG_TMP"; MSG_TMP=""
   else
+    rm -f "$MSG_TMP"; MSG_TMP=""
     record_failure "Commit failed (a pre-commit hook may have blocked it - e.g. a detected secret - or git identity is unset). Nothing was checkpointed."
     exit "$EXIT_CODE"
   fi

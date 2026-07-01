@@ -1,6 +1,13 @@
 provider = "ollama"
 model = "qwen3.5:35b"
 
+# Optional: API key for the chosen provider. May be a literal key OR a 1Password
+# reference (`op://vault/item/field`) resolved at runtime via `op read` (needs
+# OP_SERVICE_ACCOUNT_TOKEN or a signed-in session). If unset, the provider env
+# var is used (KIMI_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY). Not needed
+# for ollama. Example:
+# api_key = "op://DeLoSecrets/Kimi/API Keys/GitMark"
+
 # Other supported providers (uncomment ONE provider/model pair and set the
 # matching API key env var). All use the OpenAI-compatible chat schema.
 #
@@ -15,3 +22,15 @@ model = "qwen3.5:35b"
 # Kimi for Coding        -> KIMI_API_KEY
 # provider = "kimi"
 # model = "kimi-for-coding"
+
+# --- Commit-message narration (bin/gitmark-narrate) ---------------------------
+# git-checkpoint uses the provider/model above to narrate commit messages from
+# the session's prompts + tool calls (bloodbank/candystore) plus the staged
+# diff. This is best-effort and time-bounded; on failure it falls back to a
+# deterministic diff-summary. Tune via environment (no config keys needed):
+#   GITMARK_FAST=1                skip narration (fast timestamp message)
+#   GITMARK_NARRATE=0             disable narration entirely
+#   GITMARK_NARRATE_TIMEOUT=45    seconds allowed for narration
+#   GITMARK_NARRATE_PROVIDER=...  override provider just for narration ("none" = off)
+#   GITMARK_NARRATE_MODEL=...     override model just for narration
+#   GITMARK_CANDYSTORE_URL=http://127.0.0.1:8683   candystore query API
