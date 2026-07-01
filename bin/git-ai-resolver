@@ -3,6 +3,20 @@
 # Part of GitMark - https://github.com/delorenj/GitMark
 # Usage: git-ai-resolver [resolution_mode]
 #   resolution_mode: "rebase" (default) or "merge"
+#
+# SUBMODULE (gitlink) conflicts are resolved DETERMINISTICALLY, before any AI is
+# consulted. A submodule conflict ("commits don't follow merge-base", "Merge
+# conflict in <submodule>") is a pointer divergence, not a text conflict: the two
+# sides record different submodule commits. There is nothing to diff/merge as
+# text - cat-ing the path or grepping for <<<<<<< markers is meaningless. So we
+# pick a commit structurally: the descendant when one side is an ancestor of the
+# other, otherwise the NEWEST by committer date. This is mode-agnostic (it never
+# relies on ours/theirs, which SWAP under rebase) and needs no network or AI.
+#   Override with GITMARK_SUBMODULE_CONFLICT = newest (default) | ours | theirs.
+#
+# Environment:
+#   GITMARK_SUBMODULE_CONFLICT  How to pick a commit when a submodule pointer
+#                               conflicts: newest (default) | ours | theirs.
 
 set -euo pipefail
 
@@ -44,24 +58,121 @@ success() {
     echo -e "${GREEN}[gitmark]${NC} $1"
 }
 
+# --- git-dir helpers (work in submodules/worktrees, where .git is a FILE) ---
+git_dir() { git rev-parse --git-dir 2>/dev/null; }
+
+rebase_in_progress() {
+    local gd; gd="$(git_dir)" || return 1
+    [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]]
+}
+
+merge_in_progress() {
+    local gd; gd="$(git_dir)" || return 1
+    [[ -f "$gd/MERGE_HEAD" ]]
+}
+
 # Check if we're in the middle of a conflict resolution
 is_in_conflict() {
-    # Check for rebase in progress
-    if [[ -d ".git/rebase-merge" ]] || [[ -d ".git/rebase-apply" ]]; then
+    rebase_in_progress && return 0
+    merge_in_progress && return 0
+    local gd; gd="$(git_dir)" || gd=".git"
+    # cherry-pick / revert in progress
+    if [[ -f "$gd/CHERRY_PICK_HEAD" ]] || [[ -f "$gd/REVERT_HEAD" ]]; then
         return 0
     fi
-    # Check for merge in progress
-    if [[ -f ".git/MERGE_HEAD" ]]; then
+    # Unmerged index entries
+    if git diff --name-only --diff-filter=U 2>/dev/null | grep -q .; then
         return 0
     fi
-    # Check for cherry-pick/revert in progress
-    if [[ -f ".git/CHERRY_PICK_HEAD" ]] || [[ -f ".git/REVERT_HEAD" ]]; then
+    return 1
+}
+
+# --- Submodule (gitlink) conflict handling -------------------------------------
+# A conflicted path is a submodule when any of its unmerged index stages has the
+# gitlink mode 160000, or it is declared in .gitmodules.
+is_submodule_path() {
+    local path="$1"
+    if git ls-files --stage --error-unmatch -- "$path" 2>/dev/null | grep -q '^160000 '; then
         return 0
     fi
-    # Check for unmerged files
-    if git diff --name-only --diff-filter=U | grep -q .; then
+    if [[ -f .gitmodules ]] \
+        && git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+        | awk '{print $2}' | grep -qx "$path"; then
         return 0
     fi
+    return 1
+}
+
+# Decide which submodule commit to keep. Echoes the chosen SHA.
+# Strategy (mode-agnostic, so the rebase ours/theirs swap can't bite us):
+#   GITMARK_SUBMODULE_CONFLICT=ours   -> stage 2
+#   GITMARK_SUBMODULE_CONFLICT=theirs -> stage 3
+#   newest (default): descendant if one is an ancestor of the other, else the
+#                     commit with the newer committer date. Falls back to
+#                     whichever object actually exists locally if the other is
+#                     unfetchable (offline).
+select_submodule_commit() {
+    local path="$1" ours="$2" theirs="$3"
+    local mode="${GITMARK_SUBMODULE_CONFLICT:-newest}"
+    (
+        cd "$path" 2>/dev/null || { echo "$ours"; exit 0; }
+        case "$mode" in
+            ours)   echo "$ours";   exit 0 ;;
+            theirs) echo "$theirs"; exit 0 ;;
+        esac
+        # Make sure both commits are present locally so ancestry/date checks work.
+        git fetch --all --quiet 2>/dev/null || true
+        local have_o=0 have_t=0
+        git cat-file -e "${ours}^{commit}"   2>/dev/null && have_o=1
+        git cat-file -e "${theirs}^{commit}" 2>/dev/null && have_t=1
+        if [[ "$have_o" -eq 1 && "$have_t" -eq 0 ]]; then echo "$ours";   exit 0; fi
+        if [[ "$have_t" -eq 1 && "$have_o" -eq 0 ]]; then echo "$theirs"; exit 0; fi
+        if [[ "$have_o" -eq 0 && "$have_t" -eq 0 ]]; then echo "$ours";   exit 0; fi
+        # Prefer the descendant (it already contains the other side's history).
+        if git merge-base --is-ancestor "$ours" "$theirs" 2>/dev/null; then echo "$theirs"; exit 0; fi
+        if git merge-base --is-ancestor "$theirs" "$ours" 2>/dev/null; then echo "$ours";   exit 0; fi
+        # Diverged: newest committer date wins.
+        local do_ dt_
+        do_="$(git show -s --format=%ct "$ours"   2>/dev/null || echo 0)"
+        dt_="$(git show -s --format=%ct "$theirs" 2>/dev/null || echo 0)"
+        if [[ "${dt_:-0}" -gt "${do_:-0}" ]]; then echo "$theirs"; else echo "$ours"; fi
+    )
+}
+
+# Resolve a submodule pointer conflict by recording a single chosen commit.
+resolve_submodule_conflict() {
+    local path="$1"
+    local ours theirs pick
+    ours="$(git rev-parse ":2:$path" 2>/dev/null || true)"   # stage 2 (ours)
+    theirs="$(git rev-parse ":3:$path" 2>/dev/null || true)" # stage 3 (theirs)
+
+    # Add/edit and edit/delete variants: take whichever side has a commit.
+    if [[ -z "$ours" && -n "$theirs" ]]; then
+        pick="$theirs"
+    elif [[ -z "$theirs" && -n "$ours" ]]; then
+        pick="$ours"
+    elif [[ -n "$ours" && "$ours" == "$theirs" ]]; then
+        pick="$ours"
+    elif [[ -n "$ours" && -n "$theirs" ]]; then
+        pick="$(select_submodule_commit "$path" "$ours" "$theirs")"
+    else
+        error "Submodule $path has no recorded commits on either side; cannot auto-resolve"
+        return 1
+    fi
+    [[ -z "$pick" ]] && { error "Could not determine a commit for submodule $path"; return 1; }
+
+    log "Submodule $path: ours=${ours:0:9} theirs=${theirs:0:9} -> keeping ${pick:0:9}"
+    # Best-effort: move the submodule working tree onto the chosen commit so the
+    # superproject isn't left showing it as modified. Never fatal if it can't.
+    ( cd "$path" 2>/dev/null && git checkout -q "$pick" 2>/dev/null ) || true
+    # Authoritatively record the chosen gitlink and clear the unmerged stages.
+    if git update-index --cacheinfo "160000,$pick,$path" 2>/dev/null \
+        || git update-index --cacheinfo 160000 "$pick" "$path" 2>/dev/null \
+        || git add -- "$path" 2>/dev/null; then
+        success "Resolved submodule $path -> ${pick:0:12}"
+        return 0
+    fi
+    error "Failed to record resolved commit for submodule $path"
     return 1
 }
 
@@ -323,6 +434,18 @@ resolve_file() {
 
     log "Resolving conflicts in: $file"
 
+    # Submodule (gitlink) conflicts are structural, not textual: resolve them
+    # deterministically and skip the AI/marker path entirely (a directory has no
+    # conflict markers to read).
+    if is_submodule_path "$file"; then
+        log "Conflicted path is a submodule (gitlink): $file"
+        if resolve_submodule_conflict "$file"; then
+            return 0
+        fi
+        error "Could not resolve submodule conflict for $file"
+        return 1
+    fi
+
     local conflict_details
     conflict_details=$(get_conflict_details "$file")
 
@@ -373,7 +496,7 @@ resolve_conflicts() {
         [[ -z "$file" ]] && continue
 
         if resolve_file "$file"; then
-            ((resolved_count++))
+            resolved_count=$((resolved_count + 1))
         else
             failed_files+=("$file")
         fi
@@ -395,37 +518,51 @@ resolve_conflicts() {
     return 0
 }
 
-# Continue the rebase/merge after resolution
+# Continue the rebase/merge after resolution.
+# Returns: 0 = operation finished, 2 = more conflicts to resolve, 1 = hard failure.
+# Runs NON-INTERACTIVELY: GIT_EDITOR/GIT_SEQUENCE_EDITOR=true so a cron run with
+# no TTY never blocks on an editor. A rebased commit whose changes were fully
+# absorbed by the resolution becomes empty; git refuses to --continue it, so we
+# --skip it (dropping a now-redundant patch is the correct outcome).
 continue_operation() {
     log "Continuing $RESOLUTION_MODE..."
 
     if [[ "$RESOLUTION_MODE" == "rebase" ]]; then
-        if git rebase --continue 2>/dev/null; then
-            success "Rebase continued successfully"
-            return 0
-        else
-            # Check if there are still conflicts
+        while true; do
+            if GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true git rebase --continue >/dev/null 2>&1; then
+                rebase_in_progress || { success "Rebase continued successfully"; return 0; }
+                continue
+            fi
             if is_in_conflict; then
                 warn "Rebase still has conflicts, continuing resolution..."
                 return 2
-            else
-                error "Rebase failed to continue"
+            fi
+            if rebase_in_progress; then
+                warn "Rebased commit is empty after resolution; skipping it."
+                if GIT_EDITOR=true git rebase --skip >/dev/null 2>&1; then
+                    is_in_conflict && return 2
+                    rebase_in_progress && continue
+                    success "Rebase completed after skipping empty commit"
+                    return 0
+                fi
+                error "Rebase failed to continue (skip failed)"
                 return 1
             fi
-        fi
+            success "Rebase continued successfully"
+            return 0
+        done
     elif [[ "$RESOLUTION_MODE" == "merge" ]]; then
-        if git merge --continue 2>/dev/null || git commit 2>/dev/null; then
+        if GIT_EDITOR=true git merge --continue >/dev/null 2>&1 \
+            || GIT_EDITOR=true git commit --no-edit >/dev/null 2>&1; then
             success "Merge completed successfully"
             return 0
-        else
-            if is_in_conflict; then
-                warn "Merge still has conflicts, continuing resolution..."
-                return 2
-            else
-                error "Merge failed to continue"
-                return 1
-            fi
         fi
+        if is_in_conflict; then
+            warn "Merge still has conflicts, continuing resolution..."
+            return 2
+        fi
+        error "Merge failed to continue"
+        return 1
     fi
 
     return 0
@@ -460,10 +597,10 @@ main() {
         exit 0
     fi
 
-    # Detect operation mode if not specified
-    if [[ -d ".git/rebase-merge" ]] || [[ -d ".git/rebase-apply" ]]; then
+    # Detect operation mode if not specified (git-dir aware: works in submodules)
+    if rebase_in_progress; then
         RESOLUTION_MODE="rebase"
-    elif [[ -f ".git/MERGE_HEAD" ]]; then
+    elif merge_in_progress; then
         RESOLUTION_MODE="merge"
     fi
 
@@ -480,7 +617,7 @@ main() {
     local iteration=0
 
     while is_in_conflict && [[ $iteration -lt $max_iterations ]]; do
-        ((iteration++))
+        iteration=$((iteration + 1))
         log "Resolution attempt $iteration of $max_iterations"
 
         if resolve_conflicts; then
