@@ -58,8 +58,13 @@ while [ -L "$SOURCE" ]; do
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-AI_RESOLVER="$SCRIPT_DIR/git-ai-resolver"
+AI_RESOLVER="${GITMARK_AI_RESOLVER:-$SCRIPT_DIR/git-ai-resolver}"
 NARRATE_BIN="$SCRIPT_DIR/gitmark-narrate"
+ROUTE_BIN="$SCRIPT_DIR/gitmark-route"
+
+# Propagate hook mode to subprocesses (e.g. git-ai-resolver), which may choose to
+# disable external LLM calls when running non-interactively.
+[[ -n "${GITMARK_HOOK:-}" ]] && export GITMARK_HOOK
 
 # --- Colors: only when stdout is a TTY and NO_COLOR is unset ---
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -71,6 +76,20 @@ log()     { echo -e "${BLUE}[gitmark]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[gitmark] WARNING:${NC} $1" >&2; }
 error()   { echo -e "${RED}[gitmark] ERROR:${NC} $1" >&2; }
 success() { echo -e "${GREEN}[gitmark]${NC} $1"; }
+
+# Snapshot and restore the index so a failed commit after "git add -A" does not
+# destroy the user's original staged/unstaged state.
+backup_index() {
+  INDEX_BACKUP="$(mktemp 2>/dev/null || echo "$GIT_DIR/gitmark-index.$$")"
+  cp "$(git rev-parse --git-path index)" "$INDEX_BACKUP"
+}
+restore_index() {
+  if [[ -n "${INDEX_BACKUP:-}" && -f "$INDEX_BACKUP" ]]; then
+    cp "$INDEX_BACKUP" "$(git rev-parse --git-path index)"
+    rm -f "$INDEX_BACKUP"
+    INDEX_BACKUP=""
+  fi
+}
 
 usage() {
   cat <<'EOF'
@@ -121,6 +140,11 @@ done
 EXIT_CODE=0
 record_failure() { EXIT_CODE=1; error "$1"; }
 
+# --- Routing: when on the protected default branch, an agentic judgment call
+#     (gitmark-route) may divert this WIP checkpoint to a wip/* branch so the
+#     default branch stays clean. ROUTED=1 records that we diverted. ---
+ROUTED=0
+
 # --- Is the repo currently mid-conflict (rebase/merge/cherry-pick/unmerged)? ---
 repo_in_conflict() {
   local gd
@@ -144,13 +168,24 @@ detect_default_branch() {
   echo "main"
 }
 
-# --- Cleanup on interrupt: abort only a rebase that WE started ---
+# --- Cleanup on interrupt: restore index and abort only a rebase WE started ---
 WE_STARTED_REBASE=0
-MSG_TMP=""   # commit-message temp file; removed by the trap if we're interrupted
+MSG_TMP=""     # commit-message temp file; removed by the trap if we're interrupted
+INDEX_BACKUP=""  # backed-up index file if we staged but haven't committed
 cleanup() {
+  if [[ -n "${INDEX_BACKUP:-}" && -f "$INDEX_BACKUP" ]]; then
+    warn "Interrupted during staging/commit; restoring the original index."
+    cp "$INDEX_BACKUP" "$(git rev-parse --git-path index)" 2>/dev/null || true
+    rm -f "$INDEX_BACKUP"
+    INDEX_BACKUP=""
+  fi
   if [[ "$WE_STARTED_REBASE" == "1" ]] && repo_in_conflict; then
     warn "Interrupted during rebase; aborting to restore a clean state."
-    git rebase --abort 2>/dev/null || true
+    if git rebase --abort; then
+      WE_STARTED_REBASE=0
+    else
+      error "Could not abort rebase during cleanup; repository may be left mid-rebase"
+    fi
   fi
   [[ -n "${PUSH_TMP:-}" ]] && rm -f "$PUSH_TMP" 2>/dev/null || true
   [[ -n "${MSG_TMP:-}" ]] && rm -f "$MSG_TMP" 2>/dev/null || true
@@ -259,8 +294,11 @@ push_with_recovery() {
       else
         error "No AI resolver available; aborting rebase"
       fi
-      git rebase --abort 2>/dev/null || true
-      WE_STARTED_REBASE=0
+      if git rebase --abort; then
+        WE_STARTED_REBASE=0
+      else
+        record_failure "Could not abort rebase after failed pull-rebase; repository may be left mid-rebase"
+      fi
       return 1
     fi
     WE_STARTED_REBASE=0
@@ -351,6 +389,49 @@ secret_guard() {
   fi
 }
 
+# --- Agentic checkpoint router: divert WIP off the protected default branch ---
+# Called only when CURRENT_BRANCH == DEFAULT_BRANCH with staged changes. Asks
+# gitmark-route for a decision; on "branch" it creates/switches to wip/<slug>
+# (staged changes carry over) and sets ROUTED=1. On any failure it diverts to a
+# dated checkpoint/<date> branch (protecting the default branch is the safe
+# default). Only ever creates/switches wip|checkpoint branches. set -e safe.
+route_checkpoint() {
+  local decision route slug branch
+  decision=""
+  if [[ -x "$ROUTE_BIN" ]]; then
+    decision="$("$ROUTE_BIN" --repo "$(pwd)" --default-branch "$DEFAULT_BRANCH" 2>/dev/null || true)"
+  fi
+  route="$(printf '%s' "$decision" | sed -n 's/.*"route"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -1)"
+  slug="$(printf '%s' "$decision" | sed -n 's/.*"slug"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  if [[ "$route" != "main" && "$route" != "branch" ]]; then
+    route="branch"; slug=""
+    warn "Router unavailable; diverting checkpoint off '$DEFAULT_BRANCH' to a dated branch."
+  fi
+  if [[ "$route" == "main" ]]; then
+    log "Router: this change is fine on '$DEFAULT_BRANCH'; checkpointing there."
+    return 0
+  fi
+  slug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9/_-' '-' | sed -E 's/-+/-/g; s#^[-/]+##; s#[-/]+$##')"
+  if [[ -n "$slug" ]]; then
+    case "$slug" in wip/*|checkpoint/*) branch="$slug" ;; *) branch="wip/$slug" ;; esac
+  else
+    branch="checkpoint/$(date -u +%Y-%m-%d)"
+  fi
+  # Safety net: only ever create/switch a wip|checkpoint branch, never hijack a real one.
+  case "$branch" in wip/*|checkpoint/*) : ;; *) branch="wip/$branch" ;; esac
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git switch "$branch" 2>/dev/null || git checkout "$branch" 2>/dev/null || true
+  else
+    git switch -c "$branch" 2>/dev/null || git checkout -b "$branch" 2>/dev/null || true
+  fi
+  if [[ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" == "$branch" ]]; then
+    CURRENT_BRANCH="$branch"; ROUTED=1
+    success "Router: diverted checkpoint '$DEFAULT_BRANCH' -> '$branch' (staged changes carried over)."
+  else
+    warn "Router: could not switch to '$branch'; checkpointing on '$DEFAULT_BRANCH' as before."
+  fi
+}
+
 # ================================ main ================================
 REPO_ROOT="${1:-$(pwd)}"
 
@@ -407,7 +488,7 @@ fi
 
 # --- Fetch once (all remotes, prune stale tracking refs) ---
 echo "Fetching remotes..."
-git fetch --all --prune || warn "fetch failed (continuing with cached refs)"
+git fetch --all --prune || record_failure "fetch failed (continuing with cached refs)"
 
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
 echo "Current branch: $CURRENT_BRANCH"
@@ -421,7 +502,7 @@ fi
 
 if [[ "$HAS_SUBMODULES" == true ]]; then
   echo "Processing submodules..."
-  git submodule update --init --recursive || warn "submodule update failed (continuing)"
+  git submodule update --init --recursive || record_failure "submodule update failed (continuing)"
 
   CHECKPOINT_BIN="$(command -v git-checkpoint 2>/dev/null || true)"
   [[ -z "$CHECKPOINT_BIN" ]] && CHECKPOINT_BIN="$SCRIPT_DIR/git-checkpoint"
@@ -454,19 +535,34 @@ if [[ "$HAS_SUBMODULES" == true ]]; then
     else
       echo "  Clean; left at pinned commit (set GITMARK_SUBMODULE_SYNC=1 to advance)."
     fi
-  ' || warn "submodule processing reported errors"
+  ' || record_failure "submodule processing reported errors"
 fi
 
 # --- Stage and commit ---
+# Snapshot the index before "git add -A" so a failed commit can restore the
+# user's original staged/unstaged state instead of destroying it.
 echo "Staging all changes..."
-git add -A || { record_failure "git add -A failed"; exit "$EXIT_CODE"; }
+backup_index
+if ! git add -A; then
+  restore_index
+  record_failure "git add -A failed"
+  exit "$EXIT_CODE"
+fi
 
 # Built-in secret protection: unstage secret paths, abort on secret content.
 # Runs even when the target repo has no pre-commit hooks installed.
 secret_guard
 
+# Agentic route: keep the protected default branch clean. When we're on it with
+# staged changes, gitmark-route may divert this checkpoint to a wip/* branch
+# (staged changes carry over). Disable entirely with GITMARK_ROUTE=0.
+if [[ "${GITMARK_ROUTE:-1}" == "1" && "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]] && ! git diff --cached --quiet; then
+  route_checkpoint
+fi
+
 if git diff --cached --quiet; then
   echo "No changes to commit"
+  rm -f "$INDEX_BACKUP"; INDEX_BACKUP=""
 else
   # Narrate the commit message from bloodbank events + the staged diff. This is
   # best-effort and TIME-BOUNDED: on timeout/failure/empty output we fall back to
@@ -489,8 +585,10 @@ else
   if git commit -F "$MSG_TMP"; then
     success "Committed"
     rm -f "$MSG_TMP"; MSG_TMP=""
+    rm -f "$INDEX_BACKUP"; INDEX_BACKUP=""
   else
     rm -f "$MSG_TMP"; MSG_TMP=""
+    restore_index
     record_failure "Commit failed (a pre-commit hook may have blocked it - e.g. a detected secret - or git identity is unset). Nothing was checkpointed."
     exit "$EXIT_CODE"
   fi
@@ -502,6 +600,8 @@ if [[ "$CURRENT_BRANCH" == "HEAD" ]]; then
   warn "Detached HEAD: skipping rebase and push."
 elif [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
   : # already on the default branch - no rebase needed
+elif [[ "$ROUTED" == "1" ]]; then
+  : # routed WIP checkpoint branch - push as-is; do NOT rebase it onto the default branch
 else
   echo "Rebasing $CURRENT_BRANCH onto origin/$DEFAULT_BRANCH..."
   if ! git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
@@ -518,15 +618,21 @@ else
         WE_STARTED_REBASE=0
         success "AI resolver handled rebase conflicts"
       else
-        WE_STARTED_REBASE=0
         record_failure "AI resolver failed to resolve rebase conflicts; aborting rebase"
-        git rebase --abort 2>/dev/null || true
+        if git rebase --abort; then
+          WE_STARTED_REBASE=0
+        else
+          record_failure "Could not abort rebase; repository may be left mid-rebase"
+        fi
         REBASE_OK=0
       fi
     else
-      WE_STARTED_REBASE=0
       record_failure "Rebase conflicts and no AI resolver available; aborting rebase"
-      git rebase --abort 2>/dev/null || true
+      if git rebase --abort; then
+        WE_STARTED_REBASE=0
+      else
+        record_failure "Could not abort rebase; repository may be left mid-rebase"
+      fi
       REBASE_OK=0
     fi
   fi
@@ -544,7 +650,7 @@ fi
 
 # --- Update submodule pointers in the parent (same resilient push path) ---
 if [[ "$HAS_SUBMODULES" == true && "$CURRENT_BRANCH" != "HEAD" && "$REBASE_OK" == "1" ]]; then
-  git add -A || warn "git add for submodule pointers failed"
+  git add -A || record_failure "git add for submodule pointers failed"
   if ! git diff --cached --quiet; then
     echo "Updating submodule pointers..."
     if git commit -m "checkpoint: update submodule pointers $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then

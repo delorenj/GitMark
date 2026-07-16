@@ -4,7 +4,8 @@ AI-powered git checkpoint and conflict resolution.
 
 ## What it does
 
-- **git-checkpoint** - Stages, commits, rebases onto main, and pushes. Handles submodules. Automatically resolves conflicts using the AI resolver. Commit messages are AI-narrated (see below).
+- **git-checkpoint** - Stages, commits, rebases onto main, and pushes. Handles submodules. Automatically resolves conflicts using the AI resolver. Commit messages are AI-narrated (see below). When you're on the protected default branch, it makes an agentic **routing** judgment (see gitmark-route) before committing.
+- **gitmark-route** - When git-checkpoint is about to auto-commit onto the protected default branch, this makes a quick LLM judgment call: divert this WIP checkpoint to a `wip/<topic>` branch (the strong default — keep the default branch clean), or, for a tiny/safe change, allow it directly on the default branch. Staged changes carry over to the new branch; the default branch is never touched when diverted. Falls back to a `checkpoint/<date>` branch if the LLM is unavailable, so it never blocks. Disable with `GITMARK_ROUTE=0`.
 - **git-ai-resolver** - Analyzes git conflicts using an LLM (via OpenAI-compatible API) and resolves them autonomously. Falls back to heuristics when AI is unavailable.
 - **gitmark-narrate** - Derives the checkpoint commit message from the agent session's prompts + tool calls (bloodbank events via candystore) blended with the staged diff. Best-effort and time-bounded; falls back to a deterministic diff-summary when the event store or LLM is unavailable.
 
@@ -134,6 +135,28 @@ blocked or failed by narration:
 > deterministic fallback — configure a fast cloud model (Kimi/OpenRouter) for
 > real narratives, and make sure its API key is present in the cron/hook
 > environment, not just your interactive shell.
+
+## Privacy and external LLMs
+
+`git-ai-resolver` can ask an LLM to choose a resolution strategy or to resolve
+conflict markers. To do that it must send the conflicted file content, diffs,
+and conflict markers to the configured provider's API (Kimi, OpenRouter,
+OpenAI, or a local Ollama instance).
+
+- **Local-only mode:** set `GITMARK_AI_RESOLVER_OFFLINE=1` to disable external
+  LLM calls entirely. Submodule conflicts are still resolved structurally;
+  text conflicts fall back to heuristics or abort.
+- **Secret redaction:** conflict content is run through the same redaction
+  rules used by `gitmark-route` and `gitmark-narrate` before it leaves the
+  machine. High-signal patterns (tokens, keys, passwords, private keys,
+  `Bearer …`) are scrubbed, but redaction is best-effort — do not rely on it
+  as a guarantee.
+- **Disclosure:** when an external LLM is about to be consulted, the resolver
+  prints a warning naming the file and pointing to the offline toggle.
+
+Use `GITMARK_AI_RESOLVER_OFFLINE=1` for sensitive repositories, air-gapped
+environments, or whenever you do not want conflicted file contents sent to a
+third-party API.
 
 ## Dependencies
 

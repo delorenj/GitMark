@@ -15,8 +15,13 @@
 #   Override with GITMARK_SUBMODULE_CONFLICT = newest (default) | ours | theirs.
 #
 # Environment:
-#   GITMARK_SUBMODULE_CONFLICT  How to pick a commit when a submodule pointer
-#                               conflicts: newest (default) | ours | theirs.
+#   GITMARK_SUBMODULE_CONFLICT    How to pick a commit when a submodule pointer
+#                                 conflicts: newest (default) | ours | theirs.
+#   GITMARK_AI_RESOLVER_OFFLINE   If 1, never call an external LLM. Submodule
+#                                 conflicts are still resolved structurally;
+#                                 text conflicts fall back to heuristics/ABORT.
+#   GITMARK_AI_RESOLVER_API_URL   Override the provider's chat-completions URL
+#                                 (useful for local proxies/tests).
 
 set -euo pipefail
 
@@ -243,6 +248,25 @@ resolve_secret() {
     esac
 }
 
+# Redact high-signal secret material before sending conflict content to an LLM.
+# Mirrors gitmark-narrate and git-checkpoint's secret_guard patterns.
+redact() {
+    sed -E \
+        -e 's/(ghp_[A-Za-z0-9]{36})/[REDACTED]/g' \
+        -e 's/(gh[osru]_[A-Za-z0-9]{36})/[REDACTED]/g' \
+        -e 's/(github_pat_[A-Za-z0-9_]{60,})/[REDACTED]/g' \
+        -e 's/(AKIA[0-9A-Z]{16})/[REDACTED]/g' \
+        -e 's/(xox[baprs]-[A-Za-z0-9-]{10,})/[REDACTED]/g' \
+        -e 's/(ops_[A-Za-z0-9_-]{40,})/[REDACTED]/g' \
+        -e 's/(hvs\.[A-Za-z0-9_-]{20,})/[REDACTED]/g' \
+        -e 's/(sk-ant-[A-Za-z0-9_-]{24,})/[REDACTED]/g' \
+        -e 's/(sk-or-v1-[A-Za-z0-9]{20,})/[REDACTED]/g' \
+        -e 's/(sk-proj-[A-Za-z0-9_-]{20,})/[REDACTED]/g' \
+        -e 's/(-----BEGIN [A-Z ]*PRIVATE KEY-----)/[REDACTED]/g' \
+        -e 's/([Bb]earer[[:space:]]+)[A-Za-z0-9._-]{12,}/\1[REDACTED]/g' \
+        -e 's/((api[_-]?key|token|secret|password|passwd|pwd)[[:space:]]*[:=][[:space:]]*)[^[:space:]"'"'"']{6,}/\1[REDACTED]/gI'
+}
+
 # Call OpenRouter-compatible API
 call_ai() {
     local prompt="$1"
@@ -279,6 +303,9 @@ call_ai() {
     api_key="$(resolve_secret "$key_ref")"
     [[ -z "$api_key" ]] && api_key="$(resolve_secret "$env_key")"
 
+    # Allow tests/proxies to override the endpoint.
+    api_url="${GITMARK_AI_RESOLVER_API_URL:-$api_url}"
+
     if [[ "$provider" != "ollama" && -z "$api_key" ]]; then
         error "No API key for provider '$provider' (checked config api_key + ${provider^^}_API_KEY)"
         return 1
@@ -313,6 +340,15 @@ call_ai() {
 analyze_conflict_with_ai() {
     local conflict_details="$1"
     local file="$2"
+
+    if [[ "${GITMARK_AI_RESOLVER_OFFLINE:-0}" == "1" ]]; then
+        echo "STRATEGY: ABORT
+REASON: offline mode (GITMARK_AI_RESOLVER_OFFLINE=1); skipping external LLM"
+        return 0
+    fi
+
+    # Scrub secrets before sending any file content or diffs to the provider.
+    conflict_details="$(printf '%s' "$conflict_details" | redact)"
 
     local prompt="You are a git conflict resolution expert. Analyze this git conflict and recommend the best resolution strategy.
 
@@ -394,8 +430,12 @@ resolve_conflict_markers() {
     local file="$1"
     local conflict_details="$2"
 
+    if [[ "${GITMARK_AI_RESOLVER_OFFLINE:-0}" == "1" ]]; then
+        return 1
+    fi
+
     local file_content
-    file_content=$(cat "$file")
+    file_content=$(cat "$file" | redact)
 
     local prompt="You are resolving a git conflict. Here is the file with conflict markers:
 
@@ -484,6 +524,13 @@ resolve_file() {
 
     local conflict_details
     conflict_details=$(get_conflict_details "$file")
+
+    if [[ "${GITMARK_AI_RESOLVER_OFFLINE:-0}" == "1" ]]; then
+        log "Offline mode: skipping external LLM for $file"
+    else
+        warn "Sending conflict details for $file to the external LLM configured in $CONFIG_FILE."
+        warn "Set GITMARK_AI_RESOLVER_OFFLINE=1 to disable AI resolution."
+    fi
 
     # Try AI analysis first
     local ai_response
@@ -620,6 +667,15 @@ abort_operation() {
 # Main function
 main() {
     log "GitMark resolver starting..."
+
+    # When invoked from an automated hook, never send private conflict content to
+    # an external API unless the user has explicitly opted in with
+    # GITMARK_AI_RESOLVER_OFFLINE=0. This mirrors git-checkpoint's GITMARK_HOOK
+    # mode and prevents unattended checkpoints from leaking files.
+    if [[ "${GITMARK_HOOK:-0}" == "1" && "${GITMARK_AI_RESOLVER_OFFLINE:-}" != "0" ]]; then
+        warn "Hook mode (GITMARK_HOOK=1): disabling external LLM calls."
+        export GITMARK_AI_RESOLVER_OFFLINE=1
+    fi
 
     # Check if we're in a git repo
     if ! git rev-parse --git-dir &>/dev/null; then

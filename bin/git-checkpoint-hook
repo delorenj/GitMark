@@ -1,0 +1,28 @@
+#!/bin/bash
+# git-checkpoint-hook - wrapper for running git-checkpoint from an agent hook.
+#
+# This wrapper marks the run as hook-mode so that git-checkpoint and its
+# subprocesses (e.g. git-ai-resolver) can make safer unattended choices:
+#   - git-ai-resolver defaults to GITMARK_AI_RESOLVER_OFFLINE=1 and will not
+#     send conflicted file content to an external LLM unless the user has
+#     explicitly opted in.
+#
+# Install by pointing your hook at this script, e.g. in ~/.claude/settings.json:
+#   "stop": "setsid /path/to/GitMark/bin/git-checkpoint-hook \"$D\" </dev/null &"
+#
+# Or copy/symlink it to ~/.agents/hooks/git-checkpoint.
+
+set -euo pipefail
+
+# Resolve the real git-checkpoint next to this wrapper.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+CHECKPOINT="$SCRIPT_DIR/git-checkpoint"
+
+export GITMARK_HOOK=1
+exec "$CHECKPOINT" "$@"

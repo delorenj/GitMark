@@ -1,0 +1,116 @@
+#!/bin/bash
+# gitmark-route - agentic judgment call for git-checkpoint: when about to
+# auto-checkpoint on a PROTECTED default branch, decide whether this WIP change
+# should be diverted to a work-in-progress branch (preferred) or is trivial/safe
+# enough to land directly on the default branch.
+#
+# Emits ONE line of compact JSON on stdout:
+#   {"route":"branch"|"main","slug":"<short-kebab-topic>","reason":"..."}
+#
+# Best-effort and time-bounded. If the LLM/config/network is unavailable it
+# falls back to route=branch with an empty slug, so git-checkpoint diverts to a
+# dated checkpoint branch and NEVER blocks (protecting the default branch is the
+# safe default). Reuses GitMark's config.toml provider/model/api_key and the same
+# OpenAI-compatible endpoint as gitmark-narrate.
+#
+# Env overrides (fall back to the GITMARK_NARRATE_* equivalents, then config):
+#   GITMARK_ROUTE_PROVIDER / GITMARK_ROUTE_MODEL / GITMARK_ROUTE_API_KEY / GITMARK_ROUTE_API_URL
+#   GITMARK_ROUTE_TIMEOUT   seconds for the LLM call (default 8)
+#   GITMARK_ROUTE_DEBUG=1   log provider/model/url + raw response to stderr
+#   GITMARK_CONFIG          path to config.toml (default ~/.config/GitMark/config.toml)
+set -uo pipefail
+
+REPO="$(pwd)"; DEFAULT_BRANCH="main"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo) REPO="${2:-}"; shift 2 ;;
+    --default-branch) DEFAULT_BRANCH="${2:-main}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+CONFIG_FILE="${GITMARK_CONFIG:-$HOME/.config/GitMark/config.toml}"
+TIMEOUT="${GITMARK_ROUTE_TIMEOUT:-8}"
+
+# Deterministic safe fallback: divert to a dated checkpoint branch (protect the default branch).
+fallback() { printf '{"route":"branch","slug":"","reason":"%s"}\n' "${1:-router-unavailable}"; exit 0; }
+
+read_config() {  # single-token TOML value (provider/model)
+  local key="$1"; [[ -f "$CONFIG_FILE" ]] || return 0
+  grep -E "^${key}\s*=" "$CONFIG_FILE" 2>/dev/null | sed 's/#.*//' | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | tr -d '[:space:]' | head -n1
+}
+read_config_value() {  # space-preserving (api_key may be an op:// ref with spaces)
+  local key="$1"; [[ -f "$CONFIG_FILE" ]] || return 0
+  awk -v k="$key" '$0 ~ "^[[:space:]]*"k"[[:space:]]*=" { sub(/^[^=]*=/,""); if (match($0,/"[^"]*"/)){print substr($0,RSTART+1,RLENGTH-2);exit} sub(/#.*/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit }' "$CONFIG_FILE"
+}
+resolve_secret() {
+  local v="$1"; [[ -z "$v" ]] && return 0
+  case "$v" in op://*) command -v op >/dev/null 2>&1 || return 0; op read "$v" 2>/dev/null || true ;; *) printf '%s' "$v" ;; esac
+}
+redact() {  # scrub high-signal secrets before sending diff context to an LLM
+  sed -E -e 's/(gh[posru]_[A-Za-z0-9]{36})/[REDACTED]/g' -e 's/(github_pat_[A-Za-z0-9_]{60,})/[REDACTED]/g' \
+    -e 's/(AKIA[0-9A-Z]{16})/[REDACTED]/g' -e 's/(xox[baprs]-[A-Za-z0-9-]{10,})/[REDACTED]/g' \
+    -e 's/(sk-[A-Za-z0-9_-]{20,})/[REDACTED]/g' -e 's/(-----BEGIN [A-Z ]*PRIVATE KEY-----)/[REDACTED]/g' \
+    -e 's/((api[_-]?key|token|secret|password)[[:space:]]*[:=][[:space:]]*)[^[:space:]"'"'"']{6,}/\1[REDACTED]/gI'
+}
+
+git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fallback "not-a-repo"
+command -v curl >/dev/null 2>&1 || fallback "no-curl"
+command -v jq   >/dev/null 2>&1 || fallback "no-jq"
+
+PROVIDER="${GITMARK_ROUTE_PROVIDER:-${GITMARK_NARRATE_PROVIDER:-$(read_config provider)}}"
+MODEL="${GITMARK_ROUTE_MODEL:-${GITMARK_NARRATE_MODEL:-$(read_config model)}}"
+[[ -z "$PROVIDER" || "$PROVIDER" == "none" ]] && fallback "provider-none"
+
+case "$PROVIDER" in
+  openrouter) API_URL="https://openrouter.ai/api/v1/chat/completions"; ENV_KEY="${OPENROUTER_API_KEY:-}" ;;
+  kimi)       API_URL="https://api.kimi.com/coding/v1/chat/completions"; ENV_KEY="${KIMI_API_KEY:-}" ;;
+  openai)     API_URL="https://api.openai.com/v1/chat/completions"; ENV_KEY="${OPENAI_API_KEY:-}" ;;
+  ollama)     API_URL="${OLLAMA_HOST:-http://localhost:11434}/v1/chat/completions"; ENV_KEY="" ;;
+  *) fallback "unknown-provider" ;;
+esac
+API_URL="${GITMARK_ROUTE_API_URL:-$API_URL}"
+KEY_REF="${GITMARK_ROUTE_API_KEY:-$(read_config_value api_key)}"
+API_KEY="$(resolve_secret "$KEY_REF")"; [[ -z "$API_KEY" ]] && API_KEY="$(resolve_secret "$ENV_KEY")"
+[[ "$PROVIDER" != "ollama" && -z "$API_KEY" ]] && fallback "no-api-key"
+
+STAT="$(git -C "$REPO" diff --cached --stat 2>/dev/null | tail -n 25 | redact)"
+NAMES="$(git -C "$REPO" diff --cached --name-status 2>/dev/null | head -n 60 | redact)"
+[[ -z "${NAMES//[[:space:]]/}" ]] && fallback "nothing-staged"
+
+PROMPT="You are a git checkpoint router. An automated tool is about to commit a work-in-progress checkpoint onto the PROTECTED default branch '$DEFAULT_BRANCH'. The default branch should generally only receive deliberate, reviewed commits — WIP auto-checkpoints belong on a work-in-progress branch. Decide where THIS checkpoint should go.
+
+Return route=\"branch\" (divert to a WIP branch — the strong default) UNLESS the change is a tiny, self-contained, obviously-safe edit (e.g. a one-line typo/README tweak, a version bump) that is fine to land directly on '$DEFAULT_BRANCH', in which case return route=\"main\".
+
+When route=\"branch\", also return a short kebab-case topic slug (2-4 words, e.g. \"auth-refactor\" or \"fix-rate-limiter\") describing the work, so the branch can be named wip/<slug>.
+
+Reply with ONLY a single-line JSON object, no prose, no code fence:
+{\"route\":\"branch\"|\"main\",\"slug\":\"<kebab-or-empty>\",\"reason\":\"<=12 words\"}
+
+Staged change summary:
+$STAT
+
+Files:
+$NAMES"
+
+# kimi-for-coding only accepts temperature 1; others take a low, steadier temp.
+TEMP="0.1"; [[ "$PROVIDER" == "kimi" ]] && TEMP="1"
+[[ "${GITMARK_ROUTE_DEBUG:-0}" == "1" ]] && echo "route: provider=$PROVIDER model=$MODEL url=$API_URL" >&2
+
+RESP="$(timeout "$TIMEOUT" curl -s --max-time "$TIMEOUT" "$API_URL" \
+  -H "Content-Type: application/json" \
+  ${API_KEY:+-H "Authorization: Bearer $API_KEY"} \
+  -d "$(jq -n --arg m "$MODEL" --arg p "$PROMPT" --argjson t "$TEMP" '{model:$m,messages:[{role:"user",content:$p}],temperature:$t,stream:false}')" 2>/dev/null)" || fallback "llm-timeout"
+[[ "${GITMARK_ROUTE_DEBUG:-0}" == "1" ]] && echo "route: raw=$(printf '%s' "$RESP" | head -c 300)" >&2
+[[ -z "$RESP" ]] && fallback "empty-response"
+
+CONTENT="$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null)"
+[[ -z "$CONTENT" ]] && fallback "no-content"
+
+# Extract the JSON object the model emitted (strip fences/prose); validate route.
+JSON="$(printf '%s' "$CONTENT" | grep -oE '\{[^{}]*"route"[^{}]*\}' | head -1)"
+[[ -z "$JSON" ]] && fallback "unparseable"
+ROUTE="$(printf '%s' "$JSON" | jq -r '.route // empty' 2>/dev/null)"
+case "$ROUTE" in
+  main|branch) printf '%s\n' "$(printf '%s' "$JSON" | jq -c '{route:.route, slug:(.slug//""), reason:(.reason//"")}' 2>/dev/null)" ;;
+  *) fallback "bad-route" ;;
+esac
