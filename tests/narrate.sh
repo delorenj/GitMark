@@ -7,6 +7,8 @@
 #   EMPTY       - a clean tree yields a plain timestamp message
 #   BLOODBANK   - with a MOCK candystore, prompts + tool calls are pulled into
 #                 the LLM context, scoped to THIS repo, with secrets redacted
+#   ARGV        - provider credentials and narration context stay out of curl's
+#                 process arguments while still reaching the provider.
 #
 # The LLM is disabled throughout via GITMARK_NARRATE_PROVIDER=none, so no tokens
 # are spent and no key is required. The bloodbank path is exercised through
@@ -20,6 +22,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/../bin" && pwd)"
 NARRATE="$BIN/gitmark-narrate"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gm-narrate.XXXXXX")"
+REAL_CURL="$(command -v curl || true)"
 
 export NO_COLOR=1
 export HOME="$ROOT/home"; mkdir -p "$HOME"
@@ -135,6 +138,12 @@ fi
 exit 1
 FAKEOP
   chmod +x "$FAKEBIN/op"
+  cat > "$FAKEBIN/curl" <<'FAKECURL'
+#!/bin/bash
+printf '%s\0' "$@" > "$GITMARK_TEST_CURL_ARGV"
+exec "$GITMARK_TEST_REAL_CURL" "$@"
+FAKECURL
+  chmod +x "$FAKEBIN/curl"
 
   OPCFG="$ROOT/op.toml"
   printf 'provider = "openrouter"\nmodel = "test-model"\napi_key = "op://DeLoSecrets/Test/API Keys/GitMark"\n' > "$OPCFG"
@@ -165,6 +174,8 @@ PY
   # (and can't leak them into test output).
   OUT="$(PATH="$FAKEBIN:$PATH" \
       OPENROUTER_API_KEY= OPENAI_API_KEY= KIMI_API_KEY= \
+      GITMARK_TEST_REAL_CURL="$REAL_CURL" \
+      GITMARK_TEST_CURL_ARGV="$ROOT/narrate-curl-argv.bin" \
       GITMARK_CONFIG="$OPCFG" \
       GITMARK_NARRATE_PROVIDER=openrouter \
       GITMARK_NARRATE_API_URL="http://127.0.0.1:$OPORT/v1/chat/completions" \
@@ -174,6 +185,12 @@ PY
 
   grep -q "FAKEKEY-abc123" <<<"$OUT" && ok "op:// ref resolved and used as Bearer token" || no "op:// ref resolved and used as Bearer token"
   grep -q "(gitmark)$" <<<"$OUT" && ok "took the LLM path (not the fallback)" || no "took the LLM path (not the fallback)"
+  ! grep -a -qF "FAKEKEY-abc123" "$ROOT/narrate-curl-argv.bin" &&
+    ok "provider key absent from curl argv" ||
+    no "provider key absent from curl argv"
+  ! grep -a -qF "feature.ts" "$ROOT/narrate-curl-argv.bin" &&
+    ok "narration context absent from curl argv" ||
+    no "narration context absent from curl argv"
 else
   echo "  ⚠️  python3 not found; skipping op-key test"
 fi

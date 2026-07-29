@@ -2,9 +2,14 @@
 # Regression tests for git-checkpoint safety issues reported by a developer:
 #   1. Commit failure after "git add -A" must restore the original index so
 #      uncommitted work is not destroyed.
-#   2. Operational failures (fetch, submodule update, submodule foreach,
+#   2. A repository with no index must restore that exact absence on rollback.
+#   3. A built-in secret-guard rejection must restore the original index.
+#   4. A routed checkpoint whose commit fails must return to its original branch.
+#   5. Operational failures (fetch, submodule update, submodule foreach,
 #      submodule-pointer add) must produce a non-zero exit (no false greens).
-#   3. A failing "git rebase --abort" must be reported and handled.
+#   6. A failing "git rebase --abort" must be reported and handled.
+#   4. GitMark-owned checkpoint branches must converge into main on success,
+#      while a convergence failure preserves the checkpoint branch.
 #
 # Run: bash tests/git-checkpoint-safety.sh
 set -uo pipefail
@@ -66,6 +71,101 @@ HOOK
   [[ "$untracked" == "untracked.txt" ]] && ok "untracked file remains untracked" || no "unexpected untracked files: '$untracked'"
 
   grep -q "Nothing was checkpointed" "$out" && ok "user is told nothing was checkpointed" || no "missing 'Nothing was checkpointed' message"
+}
+
+# --- Test 1b: missing index remains absent after a failed commit ---------------
+test_commit_failure_restores_missing_index() {
+  echo "── commit failure restores an originally missing index ──"
+  local W="$ROOT/missing-index"
+  mkdir -p "$W"; cd "$W"
+  q git init -q
+  printf 'first content\n' > first.txt
+  [[ ! -e .git/index ]] || { no "test precondition: index should be absent"; return; }
+
+  mkdir -p .git/hooks
+  cat > .git/hooks/pre-commit <<'HOOK'
+#!/bin/bash
+exit 1
+HOOK
+  chmod +x .git/hooks/pre-commit
+
+  local out="$ROOT/missing-index.out"
+  "$CHECKPOINT" "$W" >"$out" 2>&1; RC=$?
+
+  [[ $RC -ne 0 ]] &&
+    ok "checkpoint exits non-zero with an originally missing index" ||
+    no "expected non-zero exit, got $RC"
+  [[ ! -e .git/index ]] &&
+    ok "index absence is restored exactly" ||
+    no "checkpoint left a new index behind"
+  [[ "$(git status --porcelain)" == "?? first.txt" ]] &&
+    ok "first file remains untracked" ||
+    no "first file state changed during rollback"
+}
+
+# --- Test 1c: secret-guard rejection restores the original index --------------
+test_secret_guard_restores_index() {
+  echo "── secret-guard rejection restores original index ──"
+  local W="$ROOT/secret-guard"
+  mkdir -p "$W"; cd "$W"
+  q git init -q
+  printf 'base\n' > tracked.txt
+  q git add tracked.txt
+  q git commit -qm init
+
+  printf 'staged edit\n' > tracked.txt
+  q git add tracked.txt
+  local fake_secret
+  fake_secret="ghp_$(printf 'A%.0s' $(seq 1 36))"
+  printf '%s\n' "$fake_secret" > leaked.txt
+
+  local out="$ROOT/secret-guard.out"
+  "$CHECKPOINT" "$W" >"$out" 2>&1; RC=$?
+
+  [[ $RC -ne 0 ]] &&
+    ok "secret-guard rejection exits non-zero" ||
+    no "expected non-zero exit, got $RC"
+  [[ "$(git diff --cached --name-only)" == "tracked.txt" ]] &&
+    ok "pre-existing staged file remains staged" ||
+    no "secret-guard changed the original staged set"
+  [[ "$(git status --porcelain | grep '^??' | awk '{print $2}')" == "leaked.txt" ]] &&
+    ok "rejected secret file remains untracked" ||
+    no "secret-guard changed the rejected file state"
+}
+
+# --- Test 1d: a routed commit failure returns to the original branch ----------
+test_routed_commit_failure_restores_branch() {
+  echo "── routed commit failure returns to original branch ──"
+  local W="$ROOT/routed-commit-failure" R="$ROOT/routed-commit-failure.git"
+  local router="$ROOT/routed-commit-failure-router"
+  make_routed_repo "$W" "$R"
+  make_branch_router "$router"
+  printf 'staged before checkpoint\n' > "$W/hourly.md"
+  q git -C "$W" add hourly.md
+
+  mkdir -p "$W/.git/hooks"
+  cat > "$W/.git/hooks/pre-commit" <<'HOOK'
+#!/bin/bash
+exit 1
+HOOK
+  chmod +x "$W/.git/hooks/pre-commit"
+
+  local out="$ROOT/routed-commit-failure.out"
+  GITMARK_ROUTE=1 GITMARK_ROUTE_BIN="$router" \
+    "$CHECKPOINT" "$W" >"$out" 2>&1; RC=$?
+
+  [[ $RC -ne 0 ]] &&
+    ok "routed checkpoint reports commit failure" ||
+    no "expected non-zero exit, got $RC"
+  [[ "$("$REAL_GIT" -C "$W" branch --show-current)" == "main" ]] &&
+    ok "original main branch is restored" ||
+    no "checkpoint stranded work on a routed branch"
+  [[ "$("$REAL_GIT" -C "$W" diff --cached --name-only)" == "hourly.md" ]] &&
+    ok "original staged state survives routed rollback" ||
+    no "routed rollback changed the staged state"
+  ! "$REAL_GIT" --git-dir="$R" show wip/hourly-docs:hourly.md >/dev/null 2>&1 &&
+    ok "failed checkpoint was not pushed" ||
+    no "failed checkpoint unexpectedly reached the remote"
 }
 
 # --- Test 2: fetch failure produces a non-zero exit ---------------------------
@@ -195,12 +295,103 @@ FG
   grep -qi "submodule" "$out" && ok "submodule failure is reported" || no "submodule failure not reported"
 }
 
+# --- Helpers for routed-checkpoint convergence tests --------------------------
+make_routed_repo() {
+  local W="$1" R="$2"
+  mkdir -p "$W"; cd "$W"
+  q git init -q
+  printf 'base\n' > README.md
+  q git add README.md; q git commit -qm init
+  q git init -q --bare "$R"
+  q git remote add origin "$R"
+  q git push -u origin main
+  q git --git-dir="$R" symbolic-ref HEAD refs/heads/main
+}
+
+make_branch_router() {
+  local path="$1"
+  cat > "$path" <<'ROUTER'
+#!/bin/bash
+printf '%s\n' '{"route":"branch","slug":"hourly-docs","reason":"test"}'
+ROUTER
+  chmod +x "$path"
+}
+
+# --- Test 5: a routed checkpoint merges to main and finishes on main ----------
+test_routed_checkpoint_converges_to_main() {
+  echo "── routed checkpoint converges to main ──"
+  local W="$ROOT/route-success" R="$ROOT/route-success.git"
+  local router="$ROOT/route-success-router"
+  make_routed_repo "$W" "$R"
+  make_branch_router "$router"
+  printf 'hourly checkpoint\n' > "$W/hourly.md"
+
+  local out="$ROOT/route-success.out"
+  GITMARK_ROUTE=1 GITMARK_ROUTE_BIN="$router" \
+    "$CHECKPOINT" "$W" >"$out" 2>&1; RC=$?
+
+  [[ $RC -eq 0 ]] && ok "routed checkpoint exits zero" || no "expected zero exit, got $RC"
+  [[ "$("$REAL_GIT" -C "$W" branch --show-current)" == "main" ]] \
+    && ok "main is checked out after success" || no "checkpoint did not finish on main"
+  "$REAL_GIT" --git-dir="$R" show main:hourly.md >/dev/null 2>&1 \
+    && ok "remote main contains checkpoint" || no "remote main is missing checkpoint"
+  "$REAL_GIT" -C "$W" show-ref --verify --quiet refs/heads/wip/hourly-docs \
+    && ok "local checkpoint branch is preserved" || no "local checkpoint branch missing"
+  "$REAL_GIT" --git-dir="$R" show-ref --verify --quiet refs/heads/wip/hourly-docs \
+    && ok "remote checkpoint branch is preserved" || no "remote checkpoint branch missing"
+  [[ "$("$REAL_GIT" -C "$W" rev-parse main)" == "$("$REAL_GIT" -C "$W" rev-parse wip/hourly-docs)" ]] \
+    && ok "main fast-forwarded to checkpoint tip" || no "main and checkpoint tip differ"
+}
+
+# --- Test 6: failed main checkout preserves the checkpoint branch -------------
+test_routed_checkpoint_switch_failure_is_safe() {
+  echo "── routed checkpoint switch failure preserves branch ──"
+  local W="$ROOT/route-switch-failure" R="$ROOT/route-switch-failure.git"
+  local router="$ROOT/route-failure-router"
+  make_routed_repo "$W" "$R"
+  make_branch_router "$router"
+  printf 'hourly checkpoint\n' > "$W/hourly.md"
+
+  local fake_git_dir="$ROOT/fake-git-switch"
+  mkdir -p "$fake_git_dir"
+  cat > "$fake_git_dir/git" <<FG
+#!/bin/bash
+if [[ "\$1" == "switch" && "\${2:-}" == "main" ]]; then
+  exit 1
+fi
+if [[ "\$1" == "checkout" && "\${2:-}" == "main" ]]; then
+  exit 1
+fi
+exec "$REAL_GIT" "\$@"
+FG
+  chmod +x "$fake_git_dir/git"
+
+  local out="$ROOT/route-switch-failure.out"
+  GITMARK_ROUTE=1 GITMARK_ROUTE_BIN="$router" PATH="$fake_git_dir:$PATH" \
+    "$CHECKPOINT" "$W" >"$out" 2>&1; RC=$?
+
+  [[ $RC -ne 0 ]] && ok "checkpoint exits non-zero when main checkout fails" || no "expected non-zero exit, got $RC"
+  [[ "$("$REAL_GIT" -C "$W" branch --show-current)" == "wip/hourly-docs" ]] \
+    && ok "checkpoint branch remains checked out" || no "checkpoint branch was not preserved"
+  "$REAL_GIT" --git-dir="$R" show wip/hourly-docs:hourly.md >/dev/null 2>&1 \
+    && ok "remote checkpoint branch retains commit" || no "remote checkpoint branch lost commit"
+  ! "$REAL_GIT" --git-dir="$R" show main:hourly.md >/dev/null 2>&1 \
+    && ok "remote main was not partially updated" || no "remote main changed despite convergence failure"
+  grep -qi "preserv" "$out" \
+    && ok "failure explains checkpoint preservation" || no "missing preservation diagnostic"
+}
+
 # --- Run ----------------------------------------------------------------------
 echo "===== git-checkpoint safety regression ====="
 test_commit_failure_restores_index
+test_commit_failure_restores_missing_index
+test_secret_guard_restores_index
+test_routed_commit_failure_restores_branch
 test_fetch_failure_nonzero
 test_rebase_abort_failure
 test_submodule_operations_failure
+test_routed_checkpoint_converges_to_main
+test_routed_checkpoint_switch_failure_is_safe
 
 echo ""
 echo "=== git-checkpoint safety tests: $PASS passed, $FAIL failed ==="

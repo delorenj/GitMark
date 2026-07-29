@@ -38,6 +38,10 @@
 #     looping a pointless rebase and reporting a misleading sync error.
 #   - ALLOW_NO_TICKET is exported so that a commit-msg hook enforcing ticket
 #     references will permit these automated checkpoint commits.
+#   - Router-created wip/* and checkpoint/* branches are temporary safety lanes:
+#     after a successful checkpoint they are merged back into the detected
+#     default branch, the default branch is pushed, and it remains checked out.
+#     Any integration failure preserves the checkpoint branch and exits non-zero.
 #   - Commit messages are NARRATED by bin/gitmark-narrate: it blends the agent
 #     session's prompts + tool calls (bloodbank events via candystore) with the
 #     staged diff and asks a fast LLM for a Conventional-Commits message. This is
@@ -60,7 +64,7 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 AI_RESOLVER="${GITMARK_AI_RESOLVER:-$SCRIPT_DIR/git-ai-resolver}"
 NARRATE_BIN="$SCRIPT_DIR/gitmark-narrate"
-ROUTE_BIN="$SCRIPT_DIR/gitmark-route"
+ROUTE_BIN="${GITMARK_ROUTE_BIN:-$SCRIPT_DIR/gitmark-route}"
 
 # Propagate hook mode to subprocesses (e.g. git-ai-resolver), which may choose to
 # disable external LLM calls when running non-interactively.
@@ -78,14 +82,38 @@ error()   { echo -e "${RED}[gitmark] ERROR:${NC} $1" >&2; }
 success() { echo -e "${GREEN}[gitmark]${NC} $1"; }
 
 # Snapshot and restore the index so a failed commit after "git add -A" does not
-# destroy the user's original staged/unstaged state.
+# destroy the user's original staged/unstaged state. A repository may validly
+# have no index yet; rollback must restore that absence instead of failing while
+# trying to copy a file that does not exist.
 backup_index() {
-  INDEX_BACKUP="$(mktemp 2>/dev/null || echo "$GIT_DIR/gitmark-index.$$")"
-  cp "$(git rev-parse --git-path index)" "$INDEX_BACKUP"
+  local index_path
+  index_path="$(git rev-parse --git-path index)"
+  INDEX_BACKUP="$(mktemp 2>/dev/null || true)"
+  if [[ -z "$INDEX_BACKUP" ]]; then
+    error "Could not create a temporary index backup"
+    return 1
+  fi
+  if [[ -f "$index_path" ]]; then
+    if ! cp "$index_path" "$INDEX_BACKUP"; then
+      rm -f "$INDEX_BACKUP"
+      INDEX_BACKUP=""
+      error "Could not back up the current index"
+      return 1
+    fi
+    INDEX_WAS_PRESENT=1
+  else
+    INDEX_WAS_PRESENT=0
+  fi
 }
 restore_index() {
   if [[ -n "${INDEX_BACKUP:-}" && -f "$INDEX_BACKUP" ]]; then
-    cp "$INDEX_BACKUP" "$(git rev-parse --git-path index)"
+    local index_path
+    index_path="$(git rev-parse --git-path index)"
+    if [[ "$INDEX_WAS_PRESENT" == "1" ]]; then
+      cp "$INDEX_BACKUP" "$index_path" || return 1
+    else
+      rm -f "$index_path" || return 1
+    fi
     rm -f "$INDEX_BACKUP"
     INDEX_BACKUP=""
   fi
@@ -95,9 +123,11 @@ usage() {
   cat <<'EOF'
 Usage: git-checkpoint [repository_root_path]
 
-Stages all changes, commits a checkpoint with an AI-narrated message, rebases
-onto the default branch (when not already on it), and pushes. Handles
-submodules. Conflicts are resolved with the GitMark AI resolver when available.
+Stages all changes, commits a checkpoint with an AI-narrated message, integrates
+with the default branch, and pushes. Router-created wip/* and checkpoint/*
+branches are merged back into the default branch, and a successful run finishes
+with the default branch checked out. Handles submodules. Conflicts are resolved
+with the GitMark AI resolver when available.
 
 The commit message is derived by bin/gitmark-narrate from the agent session's
 prompts + tool calls (bloodbank/candystore) and the staged diff. It is
@@ -140,10 +170,14 @@ done
 EXIT_CODE=0
 record_failure() { EXIT_CODE=1; error "$1"; }
 
-# --- Routing: when on the protected default branch, an agentic judgment call
-#     (gitmark-route) may divert this WIP checkpoint to a wip/* branch so the
-#     default branch stays clean. ROUTED=1 records that we diverted. ---
+# --- Routing: when on the default branch, an agentic judgment call
+#     (gitmark-route) may first divert this checkpoint to a recoverable wip/*
+#     or checkpoint/* safety branch. Successful safety branches are always
+#     integrated back into the default branch before completion. ---
 ROUTED=0
+CHECKPOINT_BRANCH=0
+CHECKPOINT_COMMITTED=0
+ORIGINAL_BRANCH=""
 
 # --- Is the repo currently mid-conflict (rebase/merge/cherry-pick/unmerged)? ---
 repo_in_conflict() {
@@ -168,16 +202,22 @@ detect_default_branch() {
   echo "main"
 }
 
-# --- Cleanup on interrupt: restore index and abort only a rebase WE started ---
+# --- Cleanup on interrupt: restore index and abort only operations WE started ---
 WE_STARTED_REBASE=0
+WE_STARTED_MERGE=0
 MSG_TMP=""     # commit-message temp file; removed by the trap if we're interrupted
 INDEX_BACKUP=""  # backed-up index file if we staged but haven't committed
+INDEX_WAS_PRESENT=0
 cleanup() {
   if [[ -n "${INDEX_BACKUP:-}" && -f "$INDEX_BACKUP" ]]; then
     warn "Interrupted during staging/commit; restoring the original index."
-    cp "$INDEX_BACKUP" "$(git rev-parse --git-path index)" 2>/dev/null || true
-    rm -f "$INDEX_BACKUP"
-    INDEX_BACKUP=""
+    restore_index 2>/dev/null || true
+  fi
+  if [[ "$ROUTED" == "1" && "$CHECKPOINT_COMMITTED" == "0" && -n "$ORIGINAL_BRANCH" ]]; then
+    warn "Interrupted before checkpoint commit; returning to '$ORIGINAL_BRANCH'."
+    git switch "$ORIGINAL_BRANCH" >/dev/null 2>&1 \
+      || git checkout "$ORIGINAL_BRANCH" >/dev/null 2>&1 \
+      || error "Could not restore original branch '$ORIGINAL_BRANCH'"
   fi
   if [[ "$WE_STARTED_REBASE" == "1" ]] && repo_in_conflict; then
     warn "Interrupted during rebase; aborting to restore a clean state."
@@ -185,6 +225,14 @@ cleanup() {
       WE_STARTED_REBASE=0
     else
       error "Could not abort rebase during cleanup; repository may be left mid-rebase"
+    fi
+  fi
+  if [[ "$WE_STARTED_MERGE" == "1" ]] && repo_in_conflict; then
+    warn "Interrupted during merge; aborting to restore the checkpoint branch."
+    if git merge --abort; then
+      WE_STARTED_MERGE=0
+    else
+      error "Could not abort merge during cleanup; repository may be left mid-merge"
     fi
   fi
   [[ -n "${PUSH_TMP:-}" ]] && rm -f "$PUSH_TMP" 2>/dev/null || true
@@ -330,6 +378,100 @@ push_with_recovery() {
   return 1
 }
 
+# --- Prepare a GitMark-owned checkpoint branch for safe default integration ---
+# Preserve both local default-branch commits and the latest fetched remote tip
+# without rewriting the checkpoint commit. This guarantees that, after these
+# merges succeed, the local default branch can fast-forward to the checkpoint
+# branch. Conflicts use the same resolver contract as the rest of GitMark.
+merge_ref_into_checkpoint() {
+  local ref="$1"
+
+  if git merge-base --is-ancestor "$ref" HEAD 2>/dev/null; then
+    return 0
+  fi
+
+  log "Merging $ref into checkpoint branch $CURRENT_BRANCH..."
+  WE_STARTED_MERGE=1
+  if git merge --no-edit "$ref"; then
+    WE_STARTED_MERGE=0
+    success "Merged $ref into $CURRENT_BRANCH"
+    return 0
+  fi
+
+  if repo_in_conflict; then
+    warn "Merge from $ref hit conflicts"
+    if [[ -x "$AI_RESOLVER" ]]; then
+      log "Invoking AI conflict resolver for checkpoint integration..."
+      if "$AI_RESOLVER" merge && ! repo_in_conflict; then
+        WE_STARTED_MERGE=0
+        success "AI resolver completed merge from $ref"
+        return 0
+      fi
+      error "AI resolver could not complete merge from $ref"
+    else
+      error "No AI resolver available for merge from $ref"
+    fi
+
+    if git merge --abort; then
+      WE_STARTED_MERGE=0
+    else
+      record_failure "Could not abort merge from $ref; repository may be left mid-merge"
+    fi
+    return 1
+  fi
+
+  WE_STARTED_MERGE=0
+  error "Merge from $ref failed without a resolvable conflict"
+  return 1
+}
+
+prepare_checkpoint_branch() {
+  if ! git show-ref --verify --quiet "refs/heads/$DEFAULT_BRANCH"; then
+    error "Local default branch '$DEFAULT_BRANCH' does not exist"
+    return 1
+  fi
+  if ! git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
+    error "origin/$DEFAULT_BRANCH not found; cannot safely integrate checkpoint branch"
+    return 1
+  fi
+
+  merge_ref_into_checkpoint "$DEFAULT_BRANCH" \
+    && merge_ref_into_checkpoint "origin/$DEFAULT_BRANCH"
+}
+
+# --- Converge a successful GitMark-owned branch back into the default branch ---
+# The checkpoint branch remains as a recoverable ref. We only claim success
+# after the default branch fast-forwards, pushes, and is still checked out.
+finish_checkpoint_branch() {
+  local checkpoint_branch="$CURRENT_BRANCH"
+
+  log "Integrating checkpoint branch '$checkpoint_branch' into '$DEFAULT_BRANCH'..."
+  if ! git switch "$DEFAULT_BRANCH" 2>/dev/null \
+    && ! git checkout "$DEFAULT_BRANCH" 2>/dev/null; then
+    error "Could not switch to default branch '$DEFAULT_BRANCH'; preserving '$checkpoint_branch'"
+    return 1
+  fi
+  CURRENT_BRANCH="$DEFAULT_BRANCH"
+
+  if ! git merge --ff-only "$checkpoint_branch"; then
+    error "Could not fast-forward '$DEFAULT_BRANCH' to '$checkpoint_branch'; checkpoint branch preserved"
+    return 1
+  fi
+
+  log "Pushing integrated default branch $DEFAULT_BRANCH..."
+  if ! push_with_recovery "$DEFAULT_BRANCH"; then
+    error "Checkpoint is merged locally, but pushing '$DEFAULT_BRANCH' failed"
+    return 1
+  fi
+
+  if [[ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" != "$DEFAULT_BRANCH" ]]; then
+    error "Checkpoint integration finished on the wrong branch"
+    return 1
+  fi
+
+  success "Checkpoint branch '$checkpoint_branch' merged into '$DEFAULT_BRANCH'; '$DEFAULT_BRANCH' is checked out."
+}
+
 # --- Built-in secret guard (defense-in-depth, runs regardless of repo hooks) ---
 # The repo-hook secrets-check (lefthook) only protects repos that installed it.
 # This guard runs unconditionally on the STAGED set, protecting every repo this
@@ -385,16 +527,16 @@ secret_guard() {
     printf '%s\n' "$added" | grep -aEo "$pat" | sed -E 's/(.{8}).*/\1…[REDACTED]/' | sort -u | sed 's/^/        /' >&2
     error "Remove the secret from the working tree (and from history if already committed),"
     error "or set GITMARK_ALLOW_SECRETS=1 to override for this run."
-    exit 1
+    return 1
   fi
 }
 
-# --- Agentic checkpoint router: divert WIP off the protected default branch ---
+# --- Agentic checkpoint router: create a recoverable checkpoint safety branch ---
 # Called only when CURRENT_BRANCH == DEFAULT_BRANCH with staged changes. Asks
 # gitmark-route for a decision; on "branch" it creates/switches to wip/<slug>
-# (staged changes carry over) and sets ROUTED=1. On any failure it diverts to a
-# dated checkpoint/<date> branch (protecting the default branch is the safe
-# default). Only ever creates/switches wip|checkpoint branches. set -e safe.
+# (staged changes carry over) and marks it for mandatory integration back into
+# the default branch. On any failure it diverts to a dated checkpoint/<date>
+# branch. Only ever creates/switches wip|checkpoint branches. set -e safe.
 route_checkpoint() {
   local decision route slug branch
   decision=""
@@ -425,7 +567,7 @@ route_checkpoint() {
     git switch -c "$branch" 2>/dev/null || git checkout -b "$branch" 2>/dev/null || true
   fi
   if [[ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" == "$branch" ]]; then
-    CURRENT_BRANCH="$branch"; ROUTED=1
+    CURRENT_BRANCH="$branch"; ROUTED=1; CHECKPOINT_BRANCH=1
     success "Router: diverted checkpoint '$DEFAULT_BRANCH' -> '$branch' (staged changes carried over)."
   else
     warn "Router: could not switch to '$branch'; checkpointing on '$DEFAULT_BRANCH' as before."
@@ -493,6 +635,10 @@ git fetch --all --prune || record_failure "fetch failed (continuing with cached 
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
 echo "Current branch: $CURRENT_BRANCH"
 DEFAULT_BRANCH="$(detect_default_branch)"
+ORIGINAL_BRANCH="$CURRENT_BRANCH"
+case "$CURRENT_BRANCH" in
+  wip/*|checkpoint/*) CHECKPOINT_BRANCH=1 ;;
+esac
 
 # --- Detect submodules ---
 HAS_SUBMODULES=false
@@ -542,16 +688,23 @@ fi
 # Snapshot the index before "git add -A" so a failed commit can restore the
 # user's original staged/unstaged state instead of destroying it.
 echo "Staging all changes..."
-backup_index
+if ! backup_index; then
+  record_failure "Could not preserve the original index; checkpoint aborted"
+  exit "$EXIT_CODE"
+fi
 if ! git add -A; then
-  restore_index
+  restore_index || record_failure "Could not restore the original index after git add failure"
   record_failure "git add -A failed"
   exit "$EXIT_CODE"
 fi
 
 # Built-in secret protection: unstage secret paths, abort on secret content.
 # Runs even when the target repo has no pre-commit hooks installed.
-secret_guard
+if ! secret_guard; then
+  restore_index || record_failure "Could not restore the original index after secret-guard rejection"
+  record_failure "Secret-guard rejected the staged checkpoint; nothing was committed"
+  exit "$EXIT_CODE"
+fi
 
 # Agentic route: keep the protected default branch clean. When we're on it with
 # staged changes, gitmark-route may divert this checkpoint to a wip/* branch
@@ -583,25 +736,43 @@ else
   echo "Committing: $(head -n1 "$MSG_TMP")"
   # No --no-verify: pre-commit hooks (e.g. secrets-check) must be able to block this.
   if git commit -F "$MSG_TMP"; then
+    CHECKPOINT_COMMITTED=1
     success "Committed"
     rm -f "$MSG_TMP"; MSG_TMP=""
     rm -f "$INDEX_BACKUP"; INDEX_BACKUP=""
   else
     rm -f "$MSG_TMP"; MSG_TMP=""
-    restore_index
+    restore_index || record_failure "Could not restore the original index after commit failure"
+    if [[ "$ROUTED" == "1" && -n "$ORIGINAL_BRANCH" ]]; then
+      if git switch "$ORIGINAL_BRANCH" >/dev/null 2>&1 \
+        || git checkout "$ORIGINAL_BRANCH" >/dev/null 2>&1; then
+        CURRENT_BRANCH="$ORIGINAL_BRANCH"
+        success "Returned to original branch '$ORIGINAL_BRANCH'"
+      else
+        record_failure "Could not return to original branch '$ORIGINAL_BRANCH' after commit failure"
+      fi
+    fi
     record_failure "Commit failed (a pre-commit hook may have blocked it - e.g. a detected secret - or git identity is unset). Nothing was checkpointed."
     exit "$EXIT_CODE"
   fi
 fi
 
-# --- Rebase onto the default branch (skip when on it, or detached) ---
+# --- Integrate with the default branch (skip when already on it or detached) ---
 REBASE_OK=1
 if [[ "$CURRENT_BRANCH" == "HEAD" ]]; then
   warn "Detached HEAD: skipping rebase and push."
 elif [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
   : # already on the default branch - no rebase needed
-elif [[ "$ROUTED" == "1" ]]; then
-  : # routed WIP checkpoint branch - push as-is; do NOT rebase it onto the default branch
+elif [[ "$CHECKPOINT_BRANCH" == "1" ]]; then
+  if [[ "$EXIT_CODE" -ne 0 ]]; then
+    warn "Earlier failures prevent safe checkpoint-branch integration; preserving $CURRENT_BRANCH."
+    REBASE_OK=0
+  elif prepare_checkpoint_branch; then
+    success "Checkpoint branch contains local and remote $DEFAULT_BRANCH"
+  else
+    record_failure "Could not prepare checkpoint branch for default-branch integration"
+    REBASE_OK=0
+  fi
 else
   echo "Rebasing $CURRENT_BRANCH onto origin/$DEFAULT_BRANCH..."
   if ! git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
@@ -658,6 +829,18 @@ if [[ "$HAS_SUBMODULES" == true && "$CURRENT_BRANCH" != "HEAD" && "$REBASE_OK" =
     else
       record_failure "Commit failed for submodule-pointer update"
     fi
+  fi
+fi
+
+# Router-created and pre-existing wip/* or checkpoint/* branches are not a
+# terminal state. Once every checkpoint operation is green, fast-forward the
+# default branch to the checkpoint, push it, and leave it checked out.
+if [[ "$CHECKPOINT_BRANCH" == "1" ]]; then
+  if [[ "$EXIT_CODE" -eq 0 && "$REBASE_OK" == "1" ]]; then
+    finish_checkpoint_branch \
+      || record_failure "Could not converge checkpoint branch into $DEFAULT_BRANCH"
+  else
+    warn "Checkpoint branch '$CURRENT_BRANCH' was preserved because the run did not complete cleanly."
   fi
 fi
 

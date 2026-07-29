@@ -2,9 +2,17 @@ PREFIX ?= $(HOME)/.local
 CONFIG_DIR ?= $(HOME)/.config/GitMark
 BIN_DIR = $(PREFIX)/bin
 
-SCRIPTS = git-checkpoint git-ai-resolver gitmark-narrate gitmark-route
+SCRIPTS = git-checkpoint git-checkpoint-hook git-ai-resolver gitmark-narrate gitmark-route
 
-.PHONY: install uninstall install-lefthook
+.PHONY: install uninstall install-lefthook test
+
+test:
+	@bash -n bin/git-checkpoint bin/git-checkpoint-hook bin/git-ai-resolver bin/gitmark-route bin/gitmark-narrate tests/*.sh
+	@bash tests/git-checkpoint-safety.sh
+	@bash tests/ai-resolver-privacy.sh
+	@bash tests/route-privacy.sh
+	@bash tests/submodule-conflict.sh
+	@bash tests/narrate.sh
 
 install:
 	@echo "Installing GitMark..."
@@ -24,7 +32,7 @@ install:
 	@echo ""
 	@$(MAKE) install-lefthook
 	@echo ""
-	@echo "Done! Commands available: git-checkpoint, git-ai-resolver, gitmark-narrate, gitmark-route"
+	@echo "Done! Commands available: git-checkpoint, git-checkpoint-hook, git-ai-resolver, gitmark-narrate, gitmark-route"
 	@echo "Config: $(CONFIG_DIR)/config.toml"
 
 uninstall:

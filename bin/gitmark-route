@@ -1,17 +1,18 @@
 #!/bin/bash
 # gitmark-route - agentic judgment call for git-checkpoint: when about to
-# auto-checkpoint on a PROTECTED default branch, decide whether this WIP change
-# should be diverted to a work-in-progress branch (preferred) or is trivial/safe
-# enough to land directly on the default branch.
+# auto-checkpoint on a default branch, decide whether this WIP change should
+# first receive a recoverable work-in-progress branch or is trivial/safe enough
+# to checkpoint directly on the default branch. git-checkpoint later converges
+# every successful router-created branch back into the default branch.
 #
 # Emits ONE line of compact JSON on stdout:
 #   {"route":"branch"|"main","slug":"<short-kebab-topic>","reason":"..."}
 #
 # Best-effort and time-bounded. If the LLM/config/network is unavailable it
 # falls back to route=branch with an empty slug, so git-checkpoint diverts to a
-# dated checkpoint branch and NEVER blocks (protecting the default branch is the
-# safe default). Reuses GitMark's config.toml provider/model/api_key and the same
-# OpenAI-compatible endpoint as gitmark-narrate.
+# dated checkpoint branch and NEVER blocks. Reuses GitMark's config.toml
+# provider/model/api_key and the same OpenAI-compatible endpoint as
+# gitmark-narrate.
 #
 # Env overrides (fall back to the GITMARK_NARRATE_* equivalents, then config):
 #   GITMARK_ROUTE_PROVIDER / GITMARK_ROUTE_MODEL / GITMARK_ROUTE_API_KEY / GITMARK_ROUTE_API_URL
@@ -31,7 +32,7 @@ done
 CONFIG_FILE="${GITMARK_CONFIG:-$HOME/.config/GitMark/config.toml}"
 TIMEOUT="${GITMARK_ROUTE_TIMEOUT:-8}"
 
-# Deterministic safe fallback: divert to a dated checkpoint branch (protect the default branch).
+# Deterministic safe fallback: create a recoverable dated checkpoint branch.
 fallback() { printf '{"route":"branch","slug":"","reason":"%s"}\n' "${1:-router-unavailable}"; exit 0; }
 
 read_config() {  # single-token TOML value (provider/model)
@@ -77,9 +78,9 @@ STAT="$(git -C "$REPO" diff --cached --stat 2>/dev/null | tail -n 25 | redact)"
 NAMES="$(git -C "$REPO" diff --cached --name-status 2>/dev/null | head -n 60 | redact)"
 [[ -z "${NAMES//[[:space:]]/}" ]] && fallback "nothing-staged"
 
-PROMPT="You are a git checkpoint router. An automated tool is about to commit a work-in-progress checkpoint onto the PROTECTED default branch '$DEFAULT_BRANCH'. The default branch should generally only receive deliberate, reviewed commits — WIP auto-checkpoints belong on a work-in-progress branch. Decide where THIS checkpoint should go.
+PROMPT="You are a git checkpoint router. An automated tool is about to checkpoint work from the default branch '$DEFAULT_BRANCH'. A substantial checkpoint should first receive a recoverable work-in-progress branch before GitMark integrates it back into '$DEFAULT_BRANCH'. Decide whether THIS checkpoint needs that safety branch.
 
-Return route=\"branch\" (divert to a WIP branch — the strong default) UNLESS the change is a tiny, self-contained, obviously-safe edit (e.g. a one-line typo/README tweak, a version bump) that is fine to land directly on '$DEFAULT_BRANCH', in which case return route=\"main\".
+Return route=\"branch\" (create a WIP safety branch — the strong default) UNLESS the change is a tiny, self-contained, obviously-safe edit (e.g. a one-line typo/README tweak, a version bump) that is fine to checkpoint directly on '$DEFAULT_BRANCH', in which case return route=\"main\".
 
 When route=\"branch\", also return a short kebab-case topic slug (2-4 words, e.g. \"auth-refactor\" or \"fix-rate-limiter\") describing the work, so the branch can be named wip/<slug>.
 
@@ -96,10 +97,30 @@ $NAMES"
 TEMP="0.1"; [[ "$PROVIDER" == "kimi" ]] && TEMP="1"
 [[ "${GITMARK_ROUTE_DEBUG:-0}" == "1" ]] && echo "route: provider=$PROVIDER model=$MODEL url=$API_URL" >&2
 
-RESP="$(timeout "$TIMEOUT" curl -s --max-time "$TIMEOUT" "$API_URL" \
-  -H "Content-Type: application/json" \
-  ${API_KEY:+-H "Authorization: Bearer $API_KEY"} \
-  -d "$(jq -n --arg m "$MODEL" --arg p "$PROMPT" --argjson t "$TEMP" '{model:$m,messages:[{role:"user",content:$p}],temperature:$t,stream:false}')" 2>/dev/null)" || fallback "llm-timeout"
+PAYLOAD="$(jq -n --arg m "$MODEL" --arg p "$PROMPT" --argjson t "$TEMP" \
+  '{model:$m,messages:[{role:"user",content:$p}],temperature:$t,stream:false}')"
+
+# Keep the key and staged-change summary out of child-process argv. The request
+# body travels over stdin and auth over an inherited descriptor.
+if [[ -n "$API_KEY" ]]; then
+  RESP="$(
+    printf '%s' "$PAYLOAD" |
+      timeout "$TIMEOUT" curl -s --max-time "$TIMEOUT" "$API_URL" \
+        -H "Content-Type: application/json" \
+        -H @/dev/fd/3 \
+        --data-binary @- \
+        3<<<"Authorization: Bearer $API_KEY" \
+        2>/dev/null
+  )" || fallback "llm-timeout"
+else
+  RESP="$(
+    printf '%s' "$PAYLOAD" |
+      timeout "$TIMEOUT" curl -s --max-time "$TIMEOUT" "$API_URL" \
+        -H "Content-Type: application/json" \
+        --data-binary @- \
+        2>/dev/null
+  )" || fallback "llm-timeout"
+fi
 [[ "${GITMARK_ROUTE_DEBUG:-0}" == "1" ]] && echo "route: raw=$(printf '%s' "$RESP" | head -c 300)" >&2
 [[ -z "$RESP" ]] && fallback "empty-response"
 

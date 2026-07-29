@@ -270,7 +270,7 @@ redact() {
 # Call OpenRouter-compatible API
 call_ai() {
     local prompt="$1"
-    local provider model api_key api_url
+    local provider model api_key api_url payload
 
     provider=$(read_config "provider")
     model=$(read_config "model")
@@ -311,23 +311,38 @@ call_ai() {
         return 1
     fi
 
-    local auth_header=""
-    if [[ -n "$api_key" ]]; then
-        auth_header="Authorization: Bearer $api_key"
-    fi
-
     # kimi-for-coding rejects any temperature except 1.
     temp="0.2"; [[ "$provider" == "kimi" ]] && temp="1"
 
+    payload="$(jq -n --arg model "$model" --arg prompt "$prompt" --argjson temp "$temp" '{
+        model: $model,
+        messages: [{ role: "user", content: $prompt }],
+        temperature: $temp
+    }')"
+
+    # Keep provider credentials and conflict context out of child-process argv:
+    # curl reads the JSON body from stdin and the optional auth header from an
+    # inherited descriptor.
     local response
-    response=$(curl -s --max-time 60 "$api_url" \
-        -H "Content-Type: application/json" \
-        ${auth_header:+-H "$auth_header"} \
-        -d "$(jq -n --arg model "$model" --arg prompt "$prompt" --argjson temp "$temp" '{
-            model: $model,
-            messages: [{ role: "user", content: $prompt }],
-            temperature: $temp
-        }')" 2>/dev/null)
+    if [[ -n "$api_key" ]]; then
+        response="$(
+            printf '%s' "$payload" |
+                curl -s --max-time 60 "$api_url" \
+                    -H "Content-Type: application/json" \
+                    -H @/dev/fd/3 \
+                    --data-binary @- \
+                    3<<<"Authorization: Bearer $api_key" \
+                    2>/dev/null
+        )"
+    else
+        response="$(
+            printf '%s' "$payload" |
+                curl -s --max-time 60 "$api_url" \
+                    -H "Content-Type: application/json" \
+                    --data-binary @- \
+                    2>/dev/null
+        )"
+    fi
 
     if [[ -z "$response" ]]; then
         return 1

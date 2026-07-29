@@ -241,7 +241,7 @@ build_context() {
 
 # --- Call the configured OpenAI-compatible chat API (mirrors git-ai-resolver) ---
 call_ai() {
-  local prompt="$1" provider model api_key api_url auth_header="" response env_key key_ref
+  local prompt="$1" provider model api_key api_url response env_key key_ref payload
   provider="${GITMARK_NARRATE_PROVIDER:-$(read_config provider)}"
   model="${GITMARK_NARRATE_MODEL:-$(read_config model)}"
   [[ "$provider" == "none" || -z "$provider" ]] && return 1
@@ -268,21 +268,39 @@ call_ai() {
     [[ "${GITMARK_NARRATE_DEBUG:-0}" == "1" ]] && echo "narrate: no usable api key for provider=$provider" >&2
     return 1
   fi
-  [[ -n "$api_key" ]] && auth_header="Authorization: Bearer $api_key"
   # kimi-for-coding rejects any temperature other than 1 ("only 1 is allowed for
   # this model"); other providers are happy with a low, more deterministic temp.
   local temp="0.2"; [[ "$provider" == "kimi" ]] && temp="1"
   [[ "${GITMARK_NARRATE_DEBUG:-0}" == "1" ]] && echo "narrate: provider=$provider model=$model temp=$temp url=$api_url" >&2
 
-  response="$(timeout "$LLM_TIMEOUT" curl -s --max-time "$LLM_TIMEOUT" "$api_url" \
-    -H "Content-Type: application/json" \
-    ${auth_header:+-H "$auth_header"} \
-    -d "$(jq -n --arg model "$model" --arg prompt "$prompt" --argjson temp "$temp" '{
-      model: $model,
-      messages: [{ role: "user", content: $prompt }],
-      temperature: $temp,
-      stream: false
-    }')" 2>/dev/null)" || return 1
+  payload="$(jq -n --arg model "$model" --arg prompt "$prompt" --argjson temp "$temp" '{
+    model: $model,
+    messages: [{ role: "user", content: $prompt }],
+    temperature: $temp,
+    stream: false
+  }')"
+
+  # Keep the key and narrated repository context out of child-process argv.
+  # The request body travels over stdin and auth over an inherited descriptor.
+  if [[ -n "$api_key" ]]; then
+    response="$(
+      printf '%s' "$payload" |
+        timeout "$LLM_TIMEOUT" curl -s --max-time "$LLM_TIMEOUT" "$api_url" \
+          -H "Content-Type: application/json" \
+          -H @/dev/fd/3 \
+          --data-binary @- \
+          3<<<"Authorization: Bearer $api_key" \
+          2>/dev/null
+    )" || return 1
+  else
+    response="$(
+      printf '%s' "$payload" |
+        timeout "$LLM_TIMEOUT" curl -s --max-time "$LLM_TIMEOUT" "$api_url" \
+          -H "Content-Type: application/json" \
+          --data-binary @- \
+          2>/dev/null
+    )" || return 1
+  fi
   if [[ "${GITMARK_NARRATE_DEBUG:-0}" == "1" ]]; then
     echo "narrate: raw response (first 400 chars): $(printf '%s' "$response" | head -c 400)" >&2
   fi

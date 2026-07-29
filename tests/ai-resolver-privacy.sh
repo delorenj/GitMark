@@ -6,6 +6,8 @@
 #              back to heuristics/ABORT without network traffic.
 #   REDACT   - conflict content sent to the configured API is scrubbed for
 #              high-signal secrets before it leaves the machine.
+#   ARGV     - provider credentials and conflict context are passed through
+#              protected input channels, never curl's process arguments.
 #
 # Run:  bash tests/ai-resolver-privacy.sh
 set -uo pipefail
@@ -14,6 +16,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$(cd "$HERE/../bin" && pwd)"
 RESOLVER="$BIN/git-ai-resolver"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gm-privacy.XXXXXX")"
+REAL_CURL="$(command -v curl || true)"
 
 export NO_COLOR=1
 export HOME="$ROOT/home"; mkdir -p "$HOME"
@@ -62,12 +65,16 @@ cat > "$SERVER" <<'PY'
 import sys, http.server
 port_file = sys.argv[1]
 body_file = sys.argv[2]
+header_file = sys.argv[3] if len(sys.argv) > 3 else ''
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_POST(self):
         n = int(self.headers.get('Content-Length', 0) or 0)
         payload = self.rfile.read(n).decode('utf-8', errors='replace')
         with open(body_file, 'w') as f: f.write(payload)
+        if header_file:
+            with open(header_file, 'w') as f:
+                f.write(self.headers.get('Authorization', ''))
         self.send_response(200)
         self.send_header('Content-Type','application/json')
         self.end_headers()
@@ -78,8 +85,8 @@ srv.serve_forever()
 PY
 
 start_server() {
-  local port_file="$1" body_file="$2"
-  python3 "$SERVER" "$port_file" "$body_file" >"$ROOT/server.out" 2>"$ROOT/server.err" &
+  local port_file="$1" body_file="$2" header_file="${3:-}"
+  python3 "$SERVER" "$port_file" "$body_file" "$header_file" >"$ROOT/server.out" 2>"$ROOT/server.err" &
   echo $!
 }
 
@@ -154,6 +161,64 @@ if command -v python3 >/dev/null 2>&1; then
   fi
 else
   echo "  ⚠️  python3 not found; skipping redaction test"
+fi
+
+echo "── ARGV: provider key and conflict context stay out of curl arguments ──"
+if command -v python3 >/dev/null 2>&1 && [[ -n "$REAL_CURL" ]]; then
+  W="$ROOT/argv"
+  build_text_conflict "$W"
+  cd "$W" || exit 1
+
+  CONTEXT_MARKER="RESOLVER_ARGV_CONTEXT_MARKER"
+  PROVIDER_KEY="test-provider-$(printf 'k%.0s' $(seq 1 32))"
+  sed -i "s/feature line/feature line; $CONTEXT_MARKER/" README.md
+
+  ARGV_CONFIG="$ROOT/argv-config.toml"
+  printf 'provider = "openrouter"\nmodel = "test-model"\napi_key = "%s"\n' "$PROVIDER_KEY" > "$ARGV_CONFIG"
+
+  FAKE_CURL_DIR="$ROOT/argv-bin"
+  ARGV_FILE="$ROOT/curl-argv.bin"
+  mkdir -p "$FAKE_CURL_DIR"
+  cat > "$FAKE_CURL_DIR/curl" <<'FAKECURL'
+#!/bin/bash
+printf '%s\0' "$@" > "$GITMARK_TEST_CURL_ARGV"
+exec "$GITMARK_TEST_REAL_CURL" "$@"
+FAKECURL
+  chmod +x "$FAKE_CURL_DIR/curl"
+
+  PORT_FILE="$ROOT/argv-port.txt"
+  BODY_FILE="$ROOT/argv-body.txt"
+  HEADER_FILE="$ROOT/argv-header.txt"
+  MOCK_PID=$(start_server "$PORT_FILE" "$BODY_FILE" "$HEADER_FILE")
+  if wait_for_port "$PORT_FILE"; then
+    MOCK_PORT="$(cat "$PORT_FILE")"
+    PATH="$FAKE_CURL_DIR:$PATH" \
+      GITMARK_CONFIG="$ARGV_CONFIG" \
+      GITMARK_TEST_REAL_CURL="$REAL_CURL" \
+      GITMARK_TEST_CURL_ARGV="$ARGV_FILE" \
+      GITMARK_AI_RESOLVER_API_URL="http://127.0.0.1:$MOCK_PORT/v1/chat/completions" \
+      timeout 15 "$RESOLVER" >/dev/null 2>&1 || true
+    kill "$MOCK_PID" 2>/dev/null || true; wait "$MOCK_PID" 2>/dev/null || true
+
+    grep -qF "Bearer $PROVIDER_KEY" "$HEADER_FILE" &&
+      ok "provider received authorization header" ||
+      no "provider received authorization header"
+    grep -qF "$CONTEXT_MARKER" "$BODY_FILE" &&
+      ok "provider received conflict context in request body" ||
+      no "provider received conflict context in request body"
+    ! grep -a -qF "$PROVIDER_KEY" "$ARGV_FILE" &&
+      ok "provider key absent from curl argv" ||
+      no "provider key absent from curl argv"
+    ! grep -a -qF "$CONTEXT_MARKER" "$ARGV_FILE" &&
+      ok "conflict context absent from curl argv" ||
+      no "conflict context absent from curl argv"
+  else
+    kill "$MOCK_PID" 2>/dev/null || true
+    echo "  ⚠️  mock server failed to start; skipping argv test"
+    cat "$ROOT/server.err" 2>/dev/null || true
+  fi
+else
+  echo "  ⚠️  python3 or curl not found; skipping argv test"
 fi
 
 echo "── HOOK: GITMARK_HOOK=1 forces offline mode ──"

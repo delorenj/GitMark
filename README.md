@@ -4,8 +4,9 @@ AI-powered git checkpoint and conflict resolution.
 
 ## What it does
 
-- **git-checkpoint** - Stages, commits, rebases onto main, and pushes. Handles submodules. Automatically resolves conflicts using the AI resolver. Commit messages are AI-narrated (see below). When you're on the protected default branch, it makes an agentic **routing** judgment (see gitmark-route) before committing.
-- **gitmark-route** - When git-checkpoint is about to auto-commit onto the protected default branch, this makes a quick LLM judgment call: divert this WIP checkpoint to a `wip/<topic>` branch (the strong default — keep the default branch clean), or, for a tiny/safe change, allow it directly on the default branch. Staged changes carry over to the new branch; the default branch is never touched when diverted. Falls back to a `checkpoint/<date>` branch if the LLM is unavailable, so it never blocks. Disable with `GITMARK_ROUTE=0`.
+- **git-checkpoint** - Stages, commits, integrates with main, and pushes. Handles submodules. Automatically resolves conflicts using the AI resolver. Commit messages are AI-narrated (see below). Router-created `wip/*` and `checkpoint/*` safety branches are always merged back into the default branch after a successful checkpoint, and the command finishes with that default branch checked out.
+- **git-checkpoint-hook** - Runs the same checkpoint flow in unattended hook mode, where external conflict-resolution calls are disabled unless explicitly opted in.
+- **gitmark-route** - When git-checkpoint is about to auto-commit from the default branch, this makes a quick LLM judgment call: create a recoverable `wip/<topic>` safety branch for substantial work, or checkpoint a tiny/safe change directly. A successful safety branch is pushed, fast-forwarded into the default branch, and left available as a recovery ref. Falls back to a `checkpoint/<date>` branch if the LLM is unavailable, so routing never blocks. Disable with `GITMARK_ROUTE=0`.
 - **git-ai-resolver** - Analyzes git conflicts using an LLM (via OpenAI-compatible API) and resolves them autonomously. Falls back to heuristics when AI is unavailable.
 - **gitmark-narrate** - Derives the checkpoint commit message from the agent session's prompts + tool calls (bloodbank events via candystore) blended with the staged diff. Best-effort and time-bounded; falls back to a deterministic diff-summary when the event store or LLM is unavailable.
 
@@ -19,7 +20,7 @@ make install
 
 This will:
 
-- Symlink `git-checkpoint`, `git-ai-resolver`, and `gitmark-narrate` into `~/.local/bin/`
+- Symlink all five commands (`git-checkpoint`, `git-checkpoint-hook`, `git-ai-resolver`, `gitmark-narrate`, and `gitmark-route`) into `~/.local/bin/`
 - Create `~/.config/GitMark/config.toml` with defaults (if it doesn't exist)
 - Install lefthook pre-commit hooks (if lefthook is installed)
 
