@@ -6,7 +6,12 @@
 #   RESILIENCE  - candystore unreachable never hangs/crashes; still exits 0
 #   EMPTY       - a clean tree yields a plain timestamp message
 #   BLOODBANK   - with a MOCK candystore, prompts + tool calls are pulled into
-#                 the LLM context, scoped to THIS repo, with secrets redacted
+#                 the LLM context, scoped to THIS repo, with secrets redacted.
+#                 The mock serves BOTH event-type generations candystore really
+#                 holds - the current 4-token bloodbank.<domain>.<entity>.<action>
+#                 and the frozen historical 5-token bloodbank.v1.* rows - so the
+#                 suite cannot go green against a shape the store no longer
+#                 writes (which is exactly how the reader went deaf unnoticed).
 #   ARGV        - provider credentials and narration context stay out of curl's
 #                 process arguments while still reaching the provider.
 #
@@ -78,16 +83,34 @@ if command -v python3 >/dev/null 2>&1; then
   _fake_kv_val="sk-$(printf 'x%.0s' $(seq 1 30))"           # long fake value
   SECRET_KV="KIMI_API_KEY=${_fake_kv_val}"
   OTHER_MARKER="EVENT_FROM_A_DIFFERENT_REPO_SHOULD_BE_FILTERED"
+  CURRENT_MARKER="PROMPT_ON_THE_CURRENT_FOUR_TOKEN_TYPE"
+  LEGACY_MARKER="PROMPT_ON_A_FROZEN_HISTORICAL_ROW"
   EVENTS_JSON="$ROOT/events.json"
+  # The mock serves what candystore ACTUALLY holds, which is two generations of
+  # the event type at once:
+  #   current  bloodbank.<domain>.<entity>.<action>      (4 tokens) - everything
+  #            stored from the grammar cutover onward
+  #   retired  bloodbank.v1.<domain>.<entity>.<action>   (5 tokens) - ~714k rows
+  #            frozen in the archive forever; they are what a narration of an
+  #            older commit reads, so the reader must still see them
+  # Both directions are asserted below. The tool.completed row is a negative
+  # probe: type normalization must not turn the .requested filter into a
+  # wildcard that sweeps in every agent event.
   cat > "$EVENTS_JSON" <<JSON
 {"events":[
-  {"type":"bloodbank.v1.conversation.turn.started","time":"2026-07-01T10:00:00Z",
-   "data":{"working_directory":"$REPO","prompt_text":"add a feature.ts and wire it up; also my token is $SECRET_TOKEN"}},
-  {"type":"bloodbank.v1.agent.tool.requested","time":"2026-07-01T10:00:01Z",
+  {"type":"bloodbank.conversation.turn.started","time":"2026-07-01T10:00:00Z",
+   "data":{"working_directory":"$REPO","prompt_text":"$CURRENT_MARKER: add a feature.ts and wire it up; also my token is $SECRET_TOKEN"}},
+  {"type":"bloodbank.agent.tool.requested","time":"2026-07-01T10:00:01Z",
    "data":{"working_directory":"$REPO","tool_name":"Bash","arguments":{"command":"export $SECRET_KV && npm test"}}},
-  {"type":"bloodbank.v1.agent.tool.requested","time":"2026-07-01T10:00:02Z",
+  {"type":"bloodbank.agent.tool.requested","time":"2026-07-01T10:00:02Z",
    "data":{"working_directory":"$REPO","tool_name":"Write","arguments":{"file_path":"feature.ts"}}},
-  {"type":"bloodbank.v1.conversation.turn.started","time":"2026-07-01T10:00:03Z",
+  {"type":"bloodbank.agent.tool.completed","time":"2026-07-01T10:00:03Z",
+   "data":{"working_directory":"$REPO","tool_name":"ShouldNotAppearCompleted","arguments":{"command":"noop"}}},
+  {"type":"bloodbank.v1.conversation.turn.started","time":"2026-06-01T09:00:00Z",
+   "data":{"working_directory":"$REPO","prompt_text":"$LEGACY_MARKER: the original ask, recorded before the grammar cutover"}},
+  {"type":"bloodbank.v1.agent.tool.requested","time":"2026-06-01T09:00:01Z",
+   "data":{"working_directory":"$REPO","tool_name":"Grep","arguments":{"pattern":"legacy_shape_tool_call"}}},
+  {"type":"bloodbank.conversation.turn.started","time":"2026-07-01T10:00:04Z",
    "data":{"working_directory":"/some/other/repo","prompt_text":"$OTHER_MARKER"}}
 ]}
 JSON
@@ -117,6 +140,16 @@ PY
   grep -q "USER PROMPTS" <<<"$CTX" && ok "context includes user prompts" || no "context includes user prompts"
   grep -q "TOOL CALLS" <<<"$CTX" && ok "context includes tool calls" || no "context includes tool calls"
   grep -q "Bash:" <<<"$CTX" && ok "tool name surfaced" || no "tool name surfaced"
+  # Both type generations must be read. Each of these two failing alone is the
+  # "narration renders empty" bug, just aimed at a different half of the archive.
+  grep -qF "$CURRENT_MARKER" <<<"$CTX" &&
+    ok "current 4-token prompt read" || no "current 4-token prompt read"
+  grep -qF "$LEGACY_MARKER" <<<"$CTX" &&
+    ok "historical 5-token prompt read" || no "historical 5-token prompt read"
+  grep -q "Grep:" <<<"$CTX" &&
+    ok "historical 5-token tool call read" || no "historical 5-token tool call read"
+  ! grep -q "ShouldNotAppearCompleted" <<<"$CTX" &&
+    ok "tool.completed not swept into tool calls" || no "tool.completed not swept into tool calls"
   ! grep -qF "$SECRET_TOKEN" <<<"$CTX" && ok "GitHub token redacted" || no "GitHub token redacted"
   ! grep -qF "$_fake_kv_val" <<<"$CTX" && ok "API-key value redacted" || no "API-key value redacted"
   grep -q "REDACTED" <<<"$CTX" && ok "redaction marker present" || no "redaction marker present"

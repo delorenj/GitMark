@@ -179,18 +179,33 @@ gather_bloodbank() {
   # Filter to events whose working_directory is inside THIS repo (project name
   # can collide across repos), sort chronologically, and emit two compact
   # sections: user prompts (intent) and tool calls (actions).
+  #
+  # Candystore holds BOTH event-type generations and always will:
+  #   retired  bloodbank.v1.<domain>.<entity>.<action>   (5 tokens, ~714k frozen
+  #                                                       historical rows)
+  #   current  bloodbank.<domain>.<entity>.<action>      (4 tokens, everything
+  #                                                       stored from the
+  #                                                       cutover onward)
+  # Payloads are otherwise identical, so `canon` strips a legacy version segment
+  # from the HEAD of the type (never the tail) and matching happens against the
+  # canonical 4-token name. Matching only one generation is the bug either way:
+  # only-4-token blanks every historical commit, only-5-token blanks every new
+  # one. This is a READER being tolerant of its own archive -- it does not
+  # loosen the grammar, which forward_envelope.py still enforces at publish time
+  # by rejecting any subject that is not exactly 5 tokens.
   printf '%s' "$resp" | jq -r --arg repo "$REPO" '
+    def canon: (.type // "") | sub("^bloodbank\\.v[0-9]+\\."; "bloodbank.");
     ( .events // [] )
     | map(select((.data.working_directory // "") | startswith($repo)))
     | sort_by(.time)
     as $e
     | ( [ $e[]
-          | select(.type == "bloodbank.v1.conversation.turn.started")
+          | select(canon == "bloodbank.conversation.turn.started")
           | (.data.prompt_text // "") | gsub("[\r\n]+"; " ") | .[0:400]
           | select(length > 0) ]
         | unique ) as $prompts
     | ( [ $e[]
-          | select(.type == "bloodbank.v1.agent.tool.requested")
+          | select(canon == "bloodbank.agent.tool.requested")
           | (.data.tool_name // "?") + ": " +
             ( ( .data.arguments.command
                 // .data.arguments.file_path
