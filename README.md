@@ -59,6 +59,7 @@ model = "qwen3.5:35b"
 | OpenAI            | `openai`     | `OPENAI_API_KEY`                               | `api.openai.com/v1`                   |
 | OpenRouter        | `openrouter` | `OPENROUTER_API_KEY`                           | `openrouter.ai/api/v1`                |
 | Kimi for Coding   | `kimi`       | `KIMI_API_KEY`                                 | `api.kimi.com/coding/v1`              |
+| AutomaticAI       | `automaticai`| `AUTOMATICAI_API_KEY`                          | `api.automaticai.io/v1`               |
 
 All providers use the OpenAI-compatible chat-completions schema. Override the
 config path with the `GITMARK_CONFIG` env var.
@@ -72,6 +73,27 @@ backend transparently maps it to the latest coding model:
 provider = "kimi"
 model = "kimi-for-coding"
 ```
+
+AutomaticAI gateway with the auto router. `automaticai/auto` lets the gateway
+pick the native model, so GitMark never names one:
+
+```toml
+provider = "automaticai"
+model = "automaticai/auto"
+api_key = "op://DeLoSecrets/AutomaticAI Gateway Tokens/gitmark"
+```
+
+Mint the token with `python3 ops/gateway-tokens.py mint gitmark --auto` from
+`client-portal/gateway`; the token needs the `automaticai/auto` scope. GitMark
+sends `User-Agent: GitMark/<tool>` and no `temperature` to this provider, because
+the router may land on a model that accepts only one value. Plain
+`automaticai/auto` infers the role from the request: with no tools and a body
+under 16 KB it goes to the fast tier (Haiku-class), anything larger to the
+orchestrator tier (Opus-class, slower and costlier). A narration request with a
+typical small checkpoint diff stays under 16 KB; a very large staged diff does not.
+The fast tier still takes 4-8 seconds per call, so `gitmark-route` defaults to a
+20 second timeout for this provider. Pin the role with `automaticai/auto/fast`
+to keep every GitMark call on the fast tier.
 
 DeepSeek via OpenRouter (no separate provider needed — OpenRouter exposes it):
 

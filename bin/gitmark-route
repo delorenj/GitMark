@@ -16,7 +16,7 @@
 #
 # Env overrides (fall back to the GITMARK_NARRATE_* equivalents, then config):
 #   GITMARK_ROUTE_PROVIDER / GITMARK_ROUTE_MODEL / GITMARK_ROUTE_API_KEY / GITMARK_ROUTE_API_URL
-#   GITMARK_ROUTE_TIMEOUT   seconds for the LLM call (default 8)
+#   GITMARK_ROUTE_TIMEOUT   seconds for the LLM call (default 8; 20 for automaticai)
 #   GITMARK_ROUTE_DEBUG=1   log provider/model/url + raw response to stderr
 #   GITMARK_CONFIG          path to config.toml (default ~/.config/GitMark/config.toml)
 set -uo pipefail
@@ -66,10 +66,14 @@ case "$PROVIDER" in
   openrouter) API_URL="https://openrouter.ai/api/v1/chat/completions"; ENV_KEY="${OPENROUTER_API_KEY:-}" ;;
   kimi)       API_URL="https://api.kimi.com/coding/v1/chat/completions"; ENV_KEY="${KIMI_API_KEY:-}" ;;
   openai)     API_URL="https://api.openai.com/v1/chat/completions"; ENV_KEY="${OPENAI_API_KEY:-}" ;;
+  automaticai) API_URL="https://api.automaticai.io/v1/chat/completions"; ENV_KEY="${AUTOMATICAI_API_KEY:-}" ;;
   ollama)     API_URL="${OLLAMA_HOST:-http://localhost:11434}/v1/chat/completions"; ENV_KEY="" ;;
   *) fallback "unknown-provider" ;;
 esac
 API_URL="${GITMARK_ROUTE_API_URL:-$API_URL}"
+# The gateway's fast tier answers in 4-8s even for a tiny JSON reply (it runs at
+# high effort), so the 8s default would time out into the safe "branch" fallback.
+[[ "$PROVIDER" == "automaticai" && -z "${GITMARK_ROUTE_TIMEOUT:-}" ]] && TIMEOUT=20
 KEY_REF="${GITMARK_ROUTE_API_KEY:-$(read_config_value api_key)}"
 API_KEY="$(resolve_secret "$KEY_REF")"; [[ -z "$API_KEY" ]] && API_KEY="$(resolve_secret "$ENV_KEY")"
 [[ "$PROVIDER" != "ollama" && -z "$API_KEY" ]] && fallback "no-api-key"
@@ -94,11 +98,15 @@ Files:
 $NAMES"
 
 # kimi-for-coding only accepts temperature 1; others take a low, steadier temp.
+# The AutomaticAI gateway's auto router may land on a route with its own
+# temperature rules, so send none and let it default.
 TEMP="0.1"; [[ "$PROVIDER" == "kimi" ]] && TEMP="1"
+UA=()
+if [[ "$PROVIDER" == "automaticai" ]]; then TEMP="null"; UA=(-H "User-Agent: GitMark/route"); fi
 [[ "${GITMARK_ROUTE_DEBUG:-0}" == "1" ]] && echo "route: provider=$PROVIDER model=$MODEL url=$API_URL" >&2
 
 PAYLOAD="$(jq -n --arg m "$MODEL" --arg p "$PROMPT" --argjson t "$TEMP" \
-  '{model:$m,messages:[{role:"user",content:$p}],temperature:$t,stream:false}')"
+  '{model:$m,messages:[{role:"user",content:$p}],temperature:$t,stream:false} | if .temperature == null then del(.temperature) else . end')"
 
 # Keep the key and staged-change summary out of child-process argv. The request
 # body travels over stdin and auth over an inherited descriptor.
@@ -107,6 +115,7 @@ if [[ -n "$API_KEY" ]]; then
     printf '%s' "$PAYLOAD" |
       timeout "$TIMEOUT" curl -s --max-time "$TIMEOUT" "$API_URL" \
         -H "Content-Type: application/json" \
+        "${UA[@]}" \
         -H @/dev/fd/3 \
         --data-binary @- \
         3<<<"Authorization: Bearer $API_KEY" \
@@ -117,6 +126,7 @@ else
     printf '%s' "$PAYLOAD" |
       timeout "$TIMEOUT" curl -s --max-time "$TIMEOUT" "$API_URL" \
         -H "Content-Type: application/json" \
+        "${UA[@]}" \
         --data-binary @- \
         2>/dev/null
   )" || fallback "llm-timeout"

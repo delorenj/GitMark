@@ -126,6 +126,47 @@ FAKECURL
     no "staged context absent from curl argv"
 fi
 
+# --- automaticai provider: URL selection, env-var key, UA, no temperature ---
+# A stub curl records argv/body and answers canned JSON, so nothing leaves the host.
+GW_BIN="$ROOT/gwbin"
+mkdir -p "$GW_BIN"
+cat > "$GW_BIN/curl" <<'FAKECURL'
+#!/bin/bash
+# Only the chat request carries a body; other curl calls (e.g. candystore) get nothing.
+case " $* " in *" --data-binary "*) ;; *) exit 22 ;; esac
+printf '%s\0' "$@" > "$GITMARK_TEST_GW_ARGV"
+cat > "$GITMARK_TEST_GW_BODY"
+for a in "$@"; do
+  case "$a" in @/dev/fd/3) cat /dev/fd/3 > "$GITMARK_TEST_GW_AUTH" ;; esac
+done
+printf '%s' '{"model":"stub","choices":[{"message":{"content":"{\"route\":\"main\",\"slug\":\"\",\"reason\":\"test\"}"}}]}'
+FAKECURL
+chmod +x "$GW_BIN/curl"
+GW_KEY="test-gw-$(printf 'g%.0s' $(seq 1 32))"
+printf 'provider = "automaticai"\nmodel = "automaticai/auto"\n' > "$ROOT/gw-config.toml"
+GW_OUT="$(
+  PATH="$GW_BIN:$PATH" \
+    GITMARK_CONFIG="$ROOT/gw-config.toml" \
+    AUTOMATICAI_API_KEY="$GW_KEY" \
+    GITMARK_TEST_GW_ARGV="$ROOT/gw-argv.bin" \
+    GITMARK_TEST_GW_BODY="$ROOT/gw-body" \
+    GITMARK_TEST_GW_AUTH="$ROOT/gw-auth" \
+    timeout 15 "$ROUTE" --repo "$TEST_REPO" --default-branch main
+)"
+grep -q '"route":"main"' <<<"$GW_OUT" && ok "automaticai: response controls route" || no "automaticai: response controls route"
+grep -a -qF "https://api.automaticai.io/v1/chat/completions" "$ROOT/gw-argv.bin" &&
+  ok "automaticai: gateway URL selected" || no "automaticai: gateway URL selected"
+grep -a -qF "User-Agent: GitMark/route" "$ROOT/gw-argv.bin" &&
+  ok "automaticai: recognizable User-Agent sent" || no "automaticai: recognizable User-Agent sent"
+grep -qF "Bearer $GW_KEY" "$ROOT/gw-auth" &&
+  ok "automaticai: AUTOMATICAI_API_KEY used for auth" || no "automaticai: AUTOMATICAI_API_KEY used for auth"
+! grep -a -qF "$GW_KEY" "$ROOT/gw-argv.bin" &&
+  ok "automaticai: key absent from curl argv" || no "automaticai: key absent from curl argv"
+[[ "$(jq -r '.model' "$ROOT/gw-body" 2>/dev/null)" == "automaticai/auto" ]] &&
+  ok "automaticai: model is automaticai/auto" || no "automaticai: model is automaticai/auto"
+[[ "$(jq 'has("temperature")' "$ROOT/gw-body" 2>/dev/null)" == "false" ]] &&
+  ok "automaticai: no temperature sent" || no "automaticai: no temperature sent"
+
 echo ""
 echo "=== route privacy tests: $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]

@@ -114,7 +114,7 @@ if command -v python3 >/dev/null 2>&1; then
    "data":{"working_directory":"/some/other/repo","prompt_text":"$OTHER_MARKER"}}
 ]}
 JSON
-  PORT=8791
+  PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')   # free port: a fixed one can be held by an unrelated server
   python3 - "$EVENTS_JSON" "$PORT" <<'PY' &
 import sys, http.server
 body = open(sys.argv[1],'rb').read()
@@ -181,7 +181,7 @@ FAKECURL
   OPCFG="$ROOT/op.toml"
   printf 'provider = "openrouter"\nmodel = "test-model"\napi_key = "op://DeLoSecrets/Test/API Keys/GitMark"\n' > "$OPCFG"
 
-  OPORT=8792
+  OPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
   python3 - "$OPORT" <<'PY' &
 import sys, http.server
 port = int(sys.argv[1])
@@ -227,6 +227,43 @@ PY
 else
   echo "  ⚠️  python3 not found; skipping op-key test"
 fi
+
+# --- automaticai provider: URL selection, env-var key, UA, no temperature ---
+# A stub curl records argv/body and answers canned JSON, so nothing leaves the host.
+GWBIN="$ROOT/gwbin"; mkdir -p "$GWBIN"
+cat > "$GWBIN/curl" <<'FAKECURL'
+#!/bin/bash
+# Only the chat request carries a body; other curl calls (e.g. candystore) get nothing.
+case " $* " in *" --data-binary "*) ;; *) exit 22 ;; esac
+printf '%s\0' "$@" > "$GITMARK_TEST_GW_ARGV"
+cat > "$GITMARK_TEST_GW_BODY"
+for a in "$@"; do
+  case "$a" in @/dev/fd/3) cat /dev/fd/3 > "$GITMARK_TEST_GW_AUTH" ;; esac
+done
+printf '%s' '{"model":"stub","choices":[{"message":{"content":"GWNARRATED"}}]}'
+FAKECURL
+chmod +x "$GWBIN/curl"
+GWKEY="gw-key-$(printf 'g%.0s' $(seq 1 24))"
+printf 'provider = "automaticai"\nmodel = "automaticai/auto"\n' > "$ROOT/gw.toml"
+OUT="$(PATH="$GWBIN:$PATH" \
+    OPENROUTER_API_KEY= OPENAI_API_KEY= KIMI_API_KEY= AUTOMATICAI_API_KEY="$GWKEY" \
+    GITMARK_TEST_GW_ARGV="$ROOT/gw-argv.bin" GITMARK_TEST_GW_BODY="$ROOT/gw-body" \
+    GITMARK_TEST_GW_AUTH="$ROOT/gw-auth" \
+    GITMARK_CONFIG="$ROOT/gw.toml" \
+    GITMARK_NARRATE_PROVIDER= \
+    GITMARK_CANDYSTORE_URL="http://127.0.0.1:1" \
+    timeout 15 "$NARRATE" --repo "$REPO" --since 1970-01-01T00:00:00Z 2>/dev/null)"
+grep -q "GWNARRATED" <<<"$OUT" && ok "automaticai: took the LLM path" || no "automaticai: took the LLM path"
+grep -a -qF "https://api.automaticai.io/v1/chat/completions" "$ROOT/gw-argv.bin" &&
+  ok "automaticai: gateway URL selected" || no "automaticai: gateway URL selected"
+grep -a -qF "User-Agent: GitMark/narrate" "$ROOT/gw-argv.bin" &&
+  ok "automaticai: recognizable User-Agent sent" || no "automaticai: recognizable User-Agent sent"
+grep -qF "Bearer $GWKEY" "$ROOT/gw-auth" &&
+  ok "automaticai: AUTOMATICAI_API_KEY used for auth" || no "automaticai: AUTOMATICAI_API_KEY used for auth"
+! grep -a -qF "$GWKEY" "$ROOT/gw-argv.bin" &&
+  ok "automaticai: key absent from curl argv" || no "automaticai: key absent from curl argv"
+[[ "$(jq -r '.model' "$ROOT/gw-body" 2>/dev/null)" == "automaticai/auto" && "$(jq 'has("temperature")' "$ROOT/gw-body" 2>/dev/null)" == "false" ]] &&
+  ok "automaticai: auto model, no temperature" || no "automaticai: auto model, no temperature"
 
 echo ""
 echo "=== narrate tests: $PASS passed, $FAIL failed ==="

@@ -4,7 +4,7 @@ model = "qwen3.5:35b"
 # Optional: API key for the chosen provider. May be a literal key OR a 1Password
 # reference (`op://vault/item/field`) resolved at runtime via `op read` (needs
 # OP_SERVICE_ACCOUNT_TOKEN or a signed-in session). If unset, the provider env
-# var is used (KIMI_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY). Not needed
+# var is used (KIMI_API_KEY / AUTOMATICAI_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY). Not needed
 # for ollama. Example:
 # api_key = "op://DeLoSecrets/Kimi/API Keys/GitMark"
 
@@ -22,6 +22,14 @@ model = "qwen3.5:35b"
 # Kimi for Coding        -> KIMI_API_KEY
 # provider = "kimi"
 # model = "kimi-for-coding"
+#
+# AutomaticAI gateway    -> AUTOMATICAI_API_KEY  (api.automaticai.io; no temperature sent)
+# "automaticai/auto" lets the gateway's auto router pick the native model. With no
+# tools and a body under 16 KB it routes to the fast tier; larger requests go to
+# the orchestrator tier. Use "automaticai/auto/fast" to pin the fast tier.
+# provider = "automaticai"
+# model = "automaticai/auto"
+# api_key = "op://DeLoSecrets/AutomaticAI Gateway Tokens/gitmark"
 
 # --- Commit-message narration (bin/gitmark-narrate) ---------------------------
 # git-checkpoint uses the provider/model above to narrate commit messages from
