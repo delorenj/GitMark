@@ -28,7 +28,7 @@ model = "qwen3.5:35b"
 # tools and a body under 16 KB it routes to the fast tier; larger requests go to
 # the orchestrator tier. Use "automaticai/auto/fast" to pin the fast tier.
 # provider = "automaticai"
-# model = "automaticai/auto"
+# model = "automaticai/auto/fast"
 # api_key = "op://DeLoSecrets/AutomaticAI Gateway Tokens/gitmark"
 
 # --- Commit-message narration (bin/gitmark-narrate) ---------------------------

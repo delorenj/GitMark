@@ -74,12 +74,12 @@ provider = "kimi"
 model = "kimi-for-coding"
 ```
 
-AutomaticAI gateway with the auto router. `automaticai/auto` lets the gateway
-pick the native model, so GitMark never names one:
+AutomaticAI gateway with the auto router. `automaticai/auto/fast` lets the
+gateway pick the native model from its fast tier, so GitMark never names one:
 
 ```toml
 provider = "automaticai"
-model = "automaticai/auto"
+model = "automaticai/auto/fast"
 api_key = "op://DeLoSecrets/AutomaticAI Gateway Tokens/gitmark"
 ```
 
@@ -91,9 +91,9 @@ the router may land on a model that accepts only one value. Plain
 under 16 KB it goes to the fast tier (Haiku-class), anything larger to the
 orchestrator tier (Opus-class, slower and costlier). A narration request with a
 typical small checkpoint diff stays under 16 KB; a very large staged diff does not.
-The fast tier still takes 4-8 seconds per call, so `gitmark-route` defaults to a
-20 second timeout for this provider. Pin the role with `automaticai/auto/fast`
-to keep every GitMark call on the fast tier.
+Use `automaticai/auto/fast`, which keeps every GitMark call on the fast tier
+whatever the diff size. The fast tier still takes 4-8 seconds per call, so
+`gitmark-route` defaults to a 20 second timeout for this provider.
 
 DeepSeek via OpenRouter (no separate provider needed — OpenRouter exposes it):
 
