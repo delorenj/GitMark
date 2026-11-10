@@ -19,7 +19,7 @@
 # Usage: gitmark-narrate --repo <path> [--since <iso8601>] [--to <iso8601>]
 #
 # Environment:
-#   GITMARK_CANDYSTORE_URL         candystore query API (default http://127.0.0.1:8683)
+#   GITMARK_CANDYSTORE_URL         candystore query API (default $CANDYSTORE_URL, then http://127.0.0.1:8683)
 #   GITMARK_NARRATE_PROVIDER       override config provider ("none" skips the LLM)
 #   GITMARK_NARRATE_MODEL          override config model
 #   GITMARK_NARRATE_API_KEY        override the API key (literal or op:// ref)
@@ -42,7 +42,8 @@
 set -uo pipefail
 
 CONFIG_FILE="${GITMARK_CONFIG:-$HOME/.config/GitMark/config.toml}"
-CANDYSTORE_URL="${GITMARK_CANDYSTORE_URL:-http://127.0.0.1:8683}"
+# GITMARK_CANDYSTORE_URL, then the platform-wide CANDYSTORE_URL, then the 8683 port contract.
+CANDYSTORE_URL="${GITMARK_CANDYSTORE_URL:-${CANDYSTORE_URL:-http://127.0.0.1:8683}}"
 MAXDIFF="${GITMARK_NARRATE_MAXDIFF:-400}"
 MAXEVENTS="${GITMARK_NARRATE_MAXEVENTS:-250}"
 LLM_TIMEOUT="${GITMARK_NARRATE_LLM_TIMEOUT:-30}"

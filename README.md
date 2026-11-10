@@ -151,7 +151,7 @@ blocked or failed by narration:
 | `GITMARK_NARRATE=0` | on | Disable narration entirely |
 | `GITMARK_NARRATE_TIMEOUT` | `45` | Seconds `git-checkpoint` allows for narration |
 | `GITMARK_NARRATE_PROVIDER` / `_MODEL` | config | Override just for narration (`none` = off) |
-| `GITMARK_CANDYSTORE_URL` | `http://127.0.0.1:8683` | candystore query API |
+| `GITMARK_CANDYSTORE_URL` | `$CANDYSTORE_URL`, then `http://127.0.0.1:8683` | candystore query API |
 
 > **Note:** narration needs a *fast* provider to fit the timeout. Large local
 > reasoning models (e.g. ollama `qwen3.x`) frequently exceed it and trigger the

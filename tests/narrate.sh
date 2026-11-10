@@ -135,7 +135,17 @@ PY
 
   CTX="$(GITMARK_CANDYSTORE_URL="http://127.0.0.1:$PORT" GITMARK_NARRATE_PRINT_CONTEXT=1 \
         timeout 15 "$NARRATE" --repo "$REPO" --since 1970-01-01T00:00:00Z 2>/dev/null)"
+  # Port contract: with GITMARK_CANDYSTORE_URL unset the platform CANDYSTORE_URL is used;
+  # when both are set, GITMARK_CANDYSTORE_URL wins.
+  CTX_PLATFORM="$(env -u GITMARK_CANDYSTORE_URL CANDYSTORE_URL="http://127.0.0.1:$PORT" GITMARK_NARRATE_PRINT_CONTEXT=1 \
+        timeout 15 "$NARRATE" --repo "$REPO" --since 1970-01-01T00:00:00Z 2>/dev/null)"
+  CTX_PRECEDENCE="$(GITMARK_CANDYSTORE_URL="http://127.0.0.1:$PORT" CANDYSTORE_URL="http://127.0.0.1:1" GITMARK_NARRATE_PRINT_CONTEXT=1 \
+        timeout 15 "$NARRATE" --repo "$REPO" --since 1970-01-01T00:00:00Z 2>/dev/null)"
   kill "$MOCK_PID" 2>/dev/null || true; wait "$MOCK_PID" 2>/dev/null || true
+  grep -qF "$CURRENT_MARKER" <<<"$CTX_PLATFORM" &&
+    ok "CANDYSTORE_URL used when GITMARK_CANDYSTORE_URL is unset" || no "CANDYSTORE_URL used when GITMARK_CANDYSTORE_URL is unset"
+  grep -qF "$CURRENT_MARKER" <<<"$CTX_PRECEDENCE" &&
+    ok "GITMARK_CANDYSTORE_URL wins over CANDYSTORE_URL" || no "GITMARK_CANDYSTORE_URL wins over CANDYSTORE_URL"
 
   grep -q "USER PROMPTS" <<<"$CTX" && ok "context includes user prompts" || no "context includes user prompts"
   grep -q "TOOL CALLS" <<<"$CTX" && ok "context includes tool calls" || no "context includes tool calls"

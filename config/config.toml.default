@@ -41,4 +41,4 @@ model = "qwen3.5:35b"
 #   GITMARK_NARRATE_TIMEOUT=45    seconds allowed for narration
 #   GITMARK_NARRATE_PROVIDER=...  override provider just for narration ("none" = off)
 #   GITMARK_NARRATE_MODEL=...     override model just for narration
-#   GITMARK_CANDYSTORE_URL=http://127.0.0.1:8683   candystore query API
+#   GITMARK_CANDYSTORE_URL=http://127.0.0.1:8683   candystore query API (unset: $CANDYSTORE_URL, then 8683)
